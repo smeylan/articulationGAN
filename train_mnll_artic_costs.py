@@ -385,12 +385,21 @@ if __name__ == "__main__":
         help='Sets the generator kernel length, must be odd'
     )
 
+    parser.add_argument(
+        '--articulation_cost_weight',
+        type=float,
+        default=0,
+        help='Weighting for the articulation cost. Higher should result in smoother EMA trajectories'
+    )
+    
+
     args = parser.parse_args()
     train_Q = True
     track_Q2 = bool(args.track_q2)
     vocab = args.vocab.split()
 
     ARCHITECTURE = args.architecture
+    ARTICULATION_COST_WEIGHT = args.articulation_cost_weight
 
     if args.synthesizer == 'ArticulationGAN':
         assert args.slice_len == 20480, "ArticulationGAN only supports a slice length of 20480"
@@ -624,7 +633,6 @@ if __name__ == "__main__":
             if (epoch <= PRODUCTION_START_EPOCH) or (epoch % COMPREHENSION_INTERVAL == 0):
                 # Just train the Q network from external data
                 if ARCHITECTURE == 'eiwgan':
-                    # pretraining not implemented yet for eiwgan. Should be simple though -- Q(reals) in the same way, with a Euclidean loss function
                     raise NotImplementedError
                 
                 if label_stages:
@@ -720,11 +728,9 @@ if __name__ == "__main__":
                         articul_out = G(z)
                         G_z_for_G_update = synthesize(EMA, articul_out.permute(0, 2, 1), synthesis_config)
 
-
                     # G Loss
                     G_loss = torch.mean(-D(G_z_for_G_update))
                     G_loss.backward(retain_graph=True)
-                    # Update
                     optimizer_G.step()
                     optimizer_G.zero_grad()
                     if label_stages:
@@ -1020,23 +1026,40 @@ if __name__ == "__main__":
                         c =  torch.from_numpy(np.vstack([sem_vector_store[i][j,:] for i,j in zip(word_indices, range(BATCH_SIZE))]).astype(np.float32)).to(device)                         
                         _z = torch.FloatTensor(BATCH_SIZE, 100 - NUM_DIM).uniform_(-1, 1).to(device)                    
                         z = torch.cat((c, _z), dim=1)                            
-                        if args.synthesizer == "WavGAN":
-                            G_z_for_Q_update = G(z) # generate again using the same labels
-                        elif args.synthesizer == "ArticulationGAN":
-                            G_z_for_Q_update = synthesize(EMA, G(z).permute(0, 2, 1), synthesis_config) 
+                    
+                    if args.synthesizer == "WavGAN":
+                        G_z_for_Q_update = G(z) # generate again using the same labels
+                    elif args.synthesizer == "ArticulationGAN":
+                        articul_out = G(z) # keep around the ema representations in order to compute articulation cost
+                        G_z_for_Q_update = synthesize(EMA, articul_out.permute(0, 2, 1), synthesis_config) 
 
                     optimizer_Q_to_QG.zero_grad()
                     if ARCHITECTURE == "eiwgan":
                         
-                        Q_production_loss = torch.mean(criterion_Q(Q(G_z_for_Q_update), c))
+                        Q_production_loss = criterion_Q(Q(G_z_for_Q_update), c)
                         # distance in the semantic space between what the child expects the adult to revover and what the child actually does
 
                     elif ARCHITECTURE in {"ciwgan", "fiwgan"}:
-                                                
+                        
                         Q_production_loss = criterion_Q(Q(G_z_for_Q_update), c)
 
-                    Q_production_loss.backward()
-                    wandb.log({"Loss/Q to G": Q_production_loss.detach().item()}, step=step)
+                    if args.synthesizer == "WavGAN":
+                        Q_production_loss.backward()
+
+                    elif args.synthesizer == "ArticulationGAN":                        
+
+                        articulation_costs = articul_out.diff(dim=2)[:,0,:].abs().sum(dim=1)                        
+
+                        Q_production_loss_augmented = torch.mean(((1. - ARTICULATION_COST_WEIGHT) * Q_production_loss) + (ARTICULATION_COST_WEIGHT*articulation_costs))
+
+                        articuation_cost_for_logging = torch.mean(ARTICULATION_COST_WEIGHT*articulation_costs).detach().item()
+
+                        wandb.log({"Loss/ArticulationCost": articuation_cost_for_logging}, step=step)
+                        wandb.log({"Loss/Q_to_G_augmented": Q_production_loss_augmented.detach().item()}, step=step)
+
+                        Q_production_loss_augmented.backward(retain_graph=True)
+
+                    wandb.log({"Loss/Q to G": torch.mean(Q_production_loss).detach().item()}, step=step)
                     optimizer_Q_to_QG.step()
                     optimizer_Q_to_QG.zero_grad()
 
