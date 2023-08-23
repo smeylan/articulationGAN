@@ -24,6 +24,8 @@ import glob
 import gc
 import wandb
 import yaml
+import time
+#from torch.profiler import profile, record_function, ProfilerActivity
 
 
 from infowavegan import WaveGANGenerator, WaveGANDiscriminator, WaveGANQNetwork
@@ -174,7 +176,7 @@ class EuclideanLoss(nn.Module):
         return torch.sqrt(torch.sum((inputs - targets) ** 2, dim=1))
 
 
-def synthesize(model, x, config):
+def synthesize(model, x, config, step):
     '''
     Given batch of EMA data and EMA model, synthesizes speech output
     Args:
@@ -183,6 +185,7 @@ def synthesize(model, x, config):
     Return:
         signal: (batch, audio_len)
     '''
+    t0 =  time.time()
     batch_size = x.shape[0]
     params_key = "generator_params"
     audio_chunk_len = config["batch_max_steps"]
@@ -204,7 +207,15 @@ def synthesize(model, x, config):
             prev_samples[:, :, :-in_chunk_len] = prev_samples[:, :, in_chunk_len:].clone()
             prev_samples[:, :, -in_chunk_len:] = cout
     out = torch.unsqueeze(torch.cat(outs, dim=1), 1)  # w2a (batch_size, seq_len, num_feats)
+    t1 =  time.time()
+    time_checkpoint(t0, t1, 'synthesize time', step)
+
     return out
+
+def time_checkpoint(t1, t2, label, step):
+    elapsed = int(1000.*(t2-t1))
+    print('Timed interval: '+label+' took '+str(elapsed)+' ms')
+    wandb.log({"Time/"+label: elapsed}, step=step)
 
 
 if __name__ == "__main__":
@@ -494,7 +505,7 @@ if __name__ == "__main__":
             G = WaveGANGenerator(nch=args.num_channels, kernel_len=args.kernel_len,     padding_len=padding_len, use_batchnorm=False).to(device).train()        
         EMA = load_model(synthesis_checkpoint_path, synthesis_config)
         EMA.remove_weight_norm()
-        EMA = EMA.eval().to(device)
+        EMA = EMA.eval().to(device)        
         D = WaveGANDiscriminator(slice_len=SLICE_LEN).to(device).train()
 
         # Optimizers
@@ -555,9 +566,8 @@ if __name__ == "__main__":
 
         return G, D, EMA, optimizer_G, optimizer_D, Q, Q2, optimizer_Q_to_QG, optimizer_Q2_to_QG, optimizer_Q2_to_Q2, criterion_Q, criterion_Q2
 
-    # Load models
+    # Load models    
     G, D, EMA, optimizer_G, optimizer_D, Q, Q2, optimizer_Q_to_QG, optimizer_Q2_to_QG, optimizer_Q2_to_Q2, criterion_Q, criterion_Q2 = make_new()
-        
     
     start_epoch = 0
     start_step = 0
@@ -571,7 +581,7 @@ if __name__ == "__main__":
     use_cached_Q2 = True
     if os.path.exists(Q2_network_path) and use_cached_Q2:
         print('Loading a Previous Adult Q2 CNN Network')
-        Q2 = torch.load(Q2_network_path)
+        Q2 = torch.load(Q2_network_path).to(device)
 
     else:
         print('Training an Adult Q2 CNN Network')
@@ -612,7 +622,7 @@ if __name__ == "__main__":
 
         print("Epoch {} of {}".format(epoch, NUM_EPOCHS))
         print("-----------------------------------------")
-
+        t1 = time.time()
 
         pbar = tqdm(dataloader)        
 
@@ -641,6 +651,7 @@ if __name__ == "__main__":
 
             else:
                 # Discriminator Update
+                t2 = time.time()
                 optimizer_D.zero_grad()                
 
                 epsilon = torch.rand(BATCH_SIZE, 1, 1).repeat(1, 1, SLICE_LEN).to(device)
@@ -671,7 +682,7 @@ if __name__ == "__main__":
                 if args.synthesizer == "WavGAN":    
                     fakes = G(z)
                 elif args.synthesizer == "ArticulationGAN":    
-                    fakes = synthesize(EMA, G(z).permute(0, 2, 1), synthesis_config)
+                    fakes = synthesize(EMA, G(z).permute(0, 2, 1), synthesis_config, step)
              
                 # shuffle the reals so that the matched item for discrim is not necessarily from the same referent. This is because the GAN is learning to distinguish *unconditioned* draws from G with real examples                
                 shuffled_reals = reals[torch.randperm(reals.shape[0]),:,:]
@@ -685,9 +696,14 @@ if __name__ == "__main__":
                     print('Discriminator update!')
                 optimizer_D.step()            
                 optimizer_D.zero_grad()
+                t3 = time.time()
+                time_checkpoint(t2, t3, 'Discriminator update', step)
+
 
                 if i % WAVEGAN_DISC_NUPDATES == 0:
-                    optimizer_G.zero_grad()                              
+                    t4 = time.time()
+                    optimizer_G.zero_grad()      
+                    EMA.zero_grad()                        
                     
                     if label_stages:
                         print('D -> G  update')
@@ -718,10 +734,11 @@ if __name__ == "__main__":
                         G_z_for_G_update = G(z) # generate again using the same labels
                     elif args.synthesizer == "ArticulationGAN":
                         articul_out = G(z)
-                        G_z_for_G_update = synthesize(EMA, articul_out.permute(0, 2, 1), synthesis_config)
+                        # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:                        
+                        #     with record_function("synthesis"):                            
+                        G_z_for_G_update = synthesize(EMA, articul_out.permute(0, 2, 1), synthesis_config, step)
 
-
-                    # G Loss
+                    # G Loss                    
                     G_loss = torch.mean(-D(G_z_for_G_update))
                     G_loss.backward(retain_graph=True)
                     # Update
@@ -730,13 +747,17 @@ if __name__ == "__main__":
                     if label_stages:
                         print('Generator update!')
                     wandb.log({"Loss/G": G_loss.detach().item()}, step=step)
+                    t5 = time.time()
+                    time_checkpoint(t4, t5, 'D -> G update', step)
 
 
                     if (epoch % WAV_OUTPUT_N == 0) & (i <= 1):
-                        
+                        t6 = time.time()
                         print('Sampling .wav outputs (but not running them through Q2)...')
                         as_words = torch.from_numpy(words).to(device) if ARCHITECTURE == 'eiwgan' else c
-                        write_out_wavs(ARCHITECTURE, G_z_for_G_update, as_words, vocab, logdir, epoch)                        
+                        write_out_wavs(ARCHITECTURE, G_z_for_G_update, as_words, vocab, logdir, epoch)
+                        t7 = time.time()
+                        time_checkpoint(t6, t7, 'WAV writeout', step)                        
                         # but don't do anything with it; just let it write out all of the audio files
                 
                     # Q2 Loss: Update G and Q to better imitate the Q2 model
@@ -745,6 +766,7 @@ if __name__ == "__main__":
                         if label_stages:
                             print('Starting Q2 evaluation...')                        
 
+                        t8 = time.time()
                         optimizer_Q2_to_QG.zero_grad() # clear the gradients for the Q update
 
                         selected_candidate_wavs = []  
@@ -788,8 +810,9 @@ if __name__ == "__main__":
                                 if args.synthesizer == "WavGAN":
                                     candidate_wavs = G(torch.cat((candidate_referents, _z), dim=1))
                                 elif args.synthesizer == "ArticulationGAN":
-                                    candidate_wavs = synthesize(EMA, G(torch.cat((candidate_referents, _z), dim=1)).permute(0, 2, 1), synthesis_config)                                
-
+                                    candidate_wavs = synthesize(EMA, G(torch.cat((candidate_referents, _z), dim=1)).permute(0, 2, 1), synthesis_config, step)                                
+                                # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:                        
+                                #     with record_function("Q decoding in utt selection"):
                                 candidate_Q_estimates = Q(candidate_wavs)
 
                                 # generate new mixed candidate wavs
@@ -849,7 +872,7 @@ if __name__ == "__main__":
                                 if args.synthesizer == "WavGAN":
                                     candidate_wavs = G(torch.cat((candidate_meanings, _z), dim=1))
                                 elif args.synthesizer == "ArticulationGAN":
-                                    candidate_wavs = synthesize(EMA, G(torch.cat((candidate_meanings, _z), dim=1)).permute(0, 2, 1), synthesis_config)
+                                    candidate_wavs = synthesize(EMA, G(torch.cat((candidate_meanings, _z), dim=1)).permute(0, 2, 1), synthesis_config, step)
 
                                 candidate_Q_estimates = Q(candidate_wavs)
 
@@ -862,10 +885,10 @@ if __name__ == "__main__":
                                 candidate_ordering = torch.argsort(candidate_predicted_values, dim=- 1, descending=True, stable=False)
 
                                 # select a subset of the candidates
-                                selected_candidate_wavs.append(torch.narrow(candidate_wavs[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE)[:,0].clone())
-                                selected_meanings.append(torch.narrow(candidate_meanings[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE).clone())
-                                selected_referents.append(torch.narrow(candidate_referents[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE).clone())
-                                selected_Q_estimates.append(torch.narrow(candidate_Q_estimates[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE).clone())
+                                selected_candidate_wavs.append(torch.narrow(candidate_wavs[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE)[:,0])
+                                selected_meanings.append(torch.narrow(candidate_meanings[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE))
+                                selected_referents.append(torch.narrow(candidate_referents[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE))
+                                selected_Q_estimates.append(torch.narrow(candidate_Q_estimates[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE))
 
 
                                 del candidate_meanings
@@ -882,7 +905,12 @@ if __name__ == "__main__":
                             selected_referents = torch.vstack(selected_referents)
                             selected_Q_estimates = torch.vstack(selected_Q_estimates)  
 
+                        t9 = time.time()
+                        time_checkpoint(t8, t9, 'Utterance selection', step)                        
+
+
                         print('Recognizing G output with Q2 model...')                        
+                        t10 = time.time()
                         if ARCHITECTURE in {"ciwgan", "fiwgan"}:
                             with torch.no_grad():
                                 Q2_probs = Q2_cnn(selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE)
@@ -892,6 +920,8 @@ if __name__ == "__main__":
 
                         elif ARCHITECTURE == "eiwgan":
 
+                            # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:                        
+                            #     with record_function("Q2 decoding in outer loop"):
                             Q2_sem_vecs = Q2_cnn(selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE) 
                             Q_prediction = selected_Q_estimates
                             
@@ -993,10 +1023,13 @@ if __name__ == "__main__":
                         if ARCHITECTURE  in ('ciwgan', 'fiwgan'):
                             # How often does the Q network repliacte the Q2 network
                             wandb.log({"Metric/Number of Q2 references replicated by Q": total_Q_recovers_Q2}, step=step)
-                        
-                   
+                        t11 = time.time()                        
+                        time_checkpoint(t10, t11, 'adult evaluation', step)
+
+                    t12 = time.time()                                      
                     if label_stages:
                         print('Q -> G, Q update')
+
 
                     if ARCHITECTURE in ("ciwgan", "fiwgan"):
                         c = get_architecture_appropriate_c(ARCHITECTURE, NUM_CATEG, BATCH_SIZE)
@@ -1020,10 +1053,11 @@ if __name__ == "__main__":
                         c =  torch.from_numpy(np.vstack([sem_vector_store[i][j,:] for i,j in zip(word_indices, range(BATCH_SIZE))]).astype(np.float32)).to(device)                         
                         _z = torch.FloatTensor(BATCH_SIZE, 100 - NUM_DIM).uniform_(-1, 1).to(device)                    
                         z = torch.cat((c, _z), dim=1)                            
-                        if args.synthesizer == "WavGAN":
-                            G_z_for_Q_update = G(z) # generate again using the same labels
-                        elif args.synthesizer == "ArticulationGAN":
-                            G_z_for_Q_update = synthesize(EMA, G(z).permute(0, 2, 1), synthesis_config) 
+                    
+                    if args.synthesizer == "WavGAN":
+                        G_z_for_Q_update = G(z) # generate again using the same labels
+                    elif args.synthesizer == "ArticulationGAN":
+                        G_z_for_Q_update = synthesize(EMA, G(z).permute(0, 2, 1), synthesis_config, step) 
 
                     optimizer_Q_to_QG.zero_grad()
                     if ARCHITECTURE == "eiwgan":
@@ -1040,20 +1074,34 @@ if __name__ == "__main__":
                     optimizer_Q_to_QG.step()
                     optimizer_Q_to_QG.zero_grad()
 
-                # save the articulation plot to wandb
-                articul_np = articul_out.cpu().detach().numpy()
-                artic_path = os.path.join(logdir,'artic_trajectories',str(epoch))
-                if not os.path.exists(artic_path):
-                    os.makedirs(artic_path)
-
-                for i in range(args.num_channels):
-                    articul = articul_np[0,i,:]
-                    plt.figure()
-                    fig, ax = plt.subplots()
-                    ax.plot(range(len(articul)), articul)
-                    plt.savefig(os.path.join(artic_path, "articulation_channel_"+str(i)+".png"))
-
+                t13 = time.time()
+                time_checkpoint(t12, t13, 'Q -> G update', step) 
+                
+                t16 = time.time()
+                time_checkpoint(t2, t16, 'Step duration', step)
                 step += 1
+
+                # print('Look at profiling information')
+                # import pdb
+                # pdb.set_trace()
+                # print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=10))
+                
+        # save out the articulation images
+        if articul_out is not None: # may be undefined when fitting Q2
+            t14 = time.time()
+            artic_path = os.path.join(logdir,'artic_trajectories',str(epoch))
+            if not os.path.exists(artic_path):
+                os.makedirs(artic_path)
+
+            for i in range(args.num_channels):
+                articul = articul_out[0,i,:].cpu().detach().numpy()                    
+                plt.plot(range(len(articul)), articul)
+                plt.savefig(os.path.join(artic_path, "articulation_channel_"+str(i)+".png"))
+            t15 = time.time()
+            time_checkpoint(t14, t15, 'Artic images', epoch)                 
+
+        t17 = time.time()
+        time_checkpoint(t1, t17, 'Epoch duration', epoch)
 
         if epoch % SAVE_INT == 0:
             if G is not None:
