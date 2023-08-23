@@ -21,6 +21,7 @@ import uuid
 import copy
 import string
 import glob 
+from Levenshtein import distance as lev
 import gc
 import wandb
 import yaml
@@ -97,9 +98,9 @@ class AudioDataSet:
 def get_architecture_appropriate_c(architecture, num_categ, batch_size):
     if ARCHITECTURE == 'ciwgan':
         c = torch.nn.functional.one_hot(torch.randint(0, num_categ, (batch_size,)),
-                                                num_classes=num_categ).to(device)
+                                                num_classes=num_categ, device=device)
     elif ARCHITECTURE == 'fiwgan':
-        c = torch.FloatTensor(batch_size, num_categ).bernoulli_().to(device)
+        c = torch.tensor([batch_size, num_categ], device=device).bernoulli_()
     else:
         assert False, "Architecture not recognized."
     return c
@@ -123,7 +124,10 @@ def Q2_cnn(selected_candidate_wavs, Q2, architecture):
     print('in Q2_cnn')
     if ARCHITECTURE == "ciwgan":
         Q2_probs = torch.softmax(Q2(selected_candidate_wavs), dim=1)
-        return Q2_probs
+        # add a column for UNKs
+        zeros = torch.zeros([Q2_probs.shape[0],1], device = device) + .00000001
+        Q_network_probs_with_unk = torch.hstack((Q2_probs, zeros))
+        return Q_network_probs_with_unk
     elif ARCHITECTURE == "eiwgan":
         # this directly returns the embeddings (of the dimensionsionality NUM_DIMS)
         return(Q2(selected_candidate_wavs))
@@ -154,19 +158,42 @@ def write_out_wavs(architecture, G_z_2d, labels, vocab, logdir, epoch):
         files_for_asr.append(copy.copy(tf))
     return(files_for_asr)
 
+def get_non_UNK_in_Q2_ciwgan(Q_network_probs, threshold, device):
+    # compute entropies
+    log_probs = torch.log(Q_network_probs + .000000001)
+    prod = Q_network_probs * log_probs
+    entropy = -torch.sum(prod, dim =1)        
+    indices_of_recognized_words = torch.argwhere( entropy <= torch.tensor([threshold], device=device)).flatten()
+    return indices_of_recognized_words
+
+def get_non_UNK_in_Q2_fiwgan(Q_network_features, threshold, device):
+    closest_vertices = torch.round(Q_network_features)
+    distance = EuclideanLoss()
+    distances = distance(Q_network_features, closest_vertices)
+    #assert distances.shape == (Q_network_features.shape[0],)
+    indices_of_recognized_words = torch.argwhere( distances <= torch.tensor([threshold], device=device)).flatten()
+    return indices_of_recognized_words
+
+def get_non_UNK_in_Q2_eiwgan(Q_network_features, word_means, threshold, device):
+    distances = get_sem_vector_distance_to_means(Q_network_features, word_means)
+    best = torch.min(distances, 0).values
+    #assert best.shape == (Q_network_features.shape[0],)
+    indices_of_recognized_words = torch.argwhere( best <= torch.tensor([threshold], device=device)).flatten()
+    return indices_of_recognized_words
 
 def one_hot_classify_sem_vector(Q2_sem_vecs, word_means):
     print('do a one_hot classification of the sem_vecs: find the closest word mean for each')
+    distances = get_sem_vector_distance_to_means(Q2_sem_vecs, word_means)
+    best = torch.argmin(distances,0)
+    return best
 
-    word_means = torch.from_numpy(np.array(word_means)).to(device)     
-    
+def get_sem_vector_distance_to_means(Q2_sem_vecs, word_means):    
     dists = [] 
     for x in range(word_means.shape[0]):
         dists.append(torch.sqrt(torch.sum((Q2_sem_vecs - word_means[x]) ** 2, dim=1)))    
     distances = torch.vstack(dists)
-    
-    best = torch.argmin(distances,0)
-    return(best)
+    #assert distances.shape == (word_means.shape[0], Q2_sem_vecs.shape[0])
+    return distances
 
 class EuclideanLoss(nn.Module):
     def __init__(self):
@@ -175,6 +202,30 @@ class EuclideanLoss(nn.Module):
     def forward(self, inputs, targets):
         return torch.sqrt(torch.sum((inputs - targets) ** 2, dim=1))
 
+def get_replacement_features(architecture, num_examples, feature_size, device):
+    return_tensor = None
+    if architecture == 'ciwgan':
+        random_labels = torch.randint(low=0, high=vocab_size, size = (num_examples,), device=device)
+        onehot_per_word = F.one_hot(random_labels, num_classes = vocab_size, device=device)
+        return_tensor = onehot_per_word
+    elif architecture == 'fiwgan':
+        # high parameter is exclusive
+        return_tensor = torch.randint(low=0, high=2, size = (num_examples, feature_size), device=device)   
+    elif architecture == 'eiwgan':        
+        return_tensor = torch_uniform((num_examples, feature_size), -1, 1, device)        
+    else:
+        raise NotImplementedError
+    
+    return return_tensor
+
+def add_noise_to_label(original_features, replacement_features, q2_noise_probability, device):
+    assert original_features.shape == replacement_features.shape
+    assert len(original_features.shape) == 2
+    mask_by_example_dim = torch.bernoulli(torch.ones(original_features.shape[0], device=device).fill_(q2_noise_probability))
+    mask_features = mask_by_example_dim.unsqueeze(1).repeat(1, original_features.shape[-1]).int()
+
+    candidate_referents = torch.where(mask_features == 1, replacement_features, original_features)
+    return candidate_referents
 
 def synthesize(model, x, config, step):
     '''
@@ -217,6 +268,24 @@ def time_checkpoint(t1, t2, label, step):
     print('Timed interval: '+label+' took '+str(elapsed)+' ms')
     wandb.log({"Time/"+label: elapsed}, step=step)
 
+def torch_uniform(shape, low, high, device):
+    rands = torch.rand(shape, device = device) #, dtype=torch.float64
+    return(low + rands * (high - low))
+
+def sample_multivatiate_normal(word_indices, word_means, sigma, NUM_CATEG, BATCH_SIZE):
+    sem_vectors = []
+    for categ_index in range(NUM_CATEG):
+        sem_vectors.append(torch.distributions.MultivariateNormal(word_means[categ_index].double(), sigma.double()).sample((BATCH_SIZE,)))                
+
+    sem_vec_store = torch.stack(sem_vectors).float()
+    c = torch.vstack([sem_vec_store[i,j,:] for i,j in zip(word_indices, range(BATCH_SIZE))])
+    return(c)
+
+def sample_multivatiate_normal_for_categ(categ_index, word_means, sigma, BATCH_SIZE):
+    return(torch.distributions.MultivariateNormal(word_means[categ_index].double(), sigma.double()).sample((BATCH_SIZE,)).float())                
+
+    
+    
 
 if __name__ == "__main__":
     # Training Arguments
@@ -305,6 +374,13 @@ if __name__ == "__main__":
         type=int,
         help='How often, in terms of epochs should the Q network be re-trained in the reference game. THe high default means that this is never run',
         default = 10000000
+    )
+
+    parser.add_argument(
+        '--q2_unk_threshold',
+        type=float,
+        help="Float representing the entropy or distance threshold that is maximally tolerated to backprop the example. Otherwise, consider the example an UNK",
+        default=.25
     )
 
     parser.add_argument(
@@ -441,7 +517,7 @@ if __name__ == "__main__":
     SAVE_INT = args.save_int
     PRODUCTION_START_EPOCH = args.production_start_epoch
     COMPREHENSION_INTERVAL = args.comprehension_interval
-
+    SELECTION_THRESHOLD = args.q2_unk_threshold
 
     #Sizes of things
     SLICE_LEN = args.slice_len
@@ -482,12 +558,17 @@ if __name__ == "__main__":
     if ARCHITECTURE == "eiwgan":
         if NUM_CATEG != 4:
             raise ValueError('NUM_CATEG must be 4 for hard-coded word means in Eiwgan. Make this variable later.')
-        word_means = [[-.5,-.5],[-.5,.5],[.5,-.5],[.5,.5]]
+        word_means = np.array([[-.5,-.5],[-.5,.5],[.5,-.5],[.5,.5]])
         NUM_DIM = len(word_means[0])
         sigma = np.matrix([[.025,0],[0,.025]])
+        
         dataset = AudioDataSet(datadir, SLICE_LEN, NUM_CATEG, vocab, word_means, sigma)
     else:
         dataset = AudioDataSet(datadir, SLICE_LEN, NUM_CATEG, vocab)
+
+    word_means = torch.from_numpy(word_means).to(device)
+    sigma = torch.from_numpy(sigma).to(device) 
+
 
     dataloader = DataLoader(
         dataset,
@@ -599,7 +680,9 @@ if __name__ == "__main__":
                 optimizer_Q2_to_Q2.zero_grad()
                 Q2_logits = Q2(reals)    
                 
-                if ARCHITECTURE in ("ciwgan", "fiwgan"):
+                if ARCHITECTURE == 'ciwgan':
+                    Q2_comprehension_loss = criterion_Q(Q2_logits, labels[:,0:NUM_CATEG]) # Note we exclude the UNK label --  child never intends to produce unk
+                elif ARCHITECTURE == 'fiwgan':
                     Q2_comprehension_loss = criterion_Q(Q2_logits, labels)
                 elif ARCHITECTURE == "eiwgan":                    
                     Q2_comprehension_loss = torch.mean(criterion_Q(Q2_logits, continuous_labels))
@@ -642,7 +725,7 @@ if __name__ == "__main__":
 
                 optimizer_Q_to_Q.zero_grad()
                 child_recovers_from_adult = Q(reals)    
-                Q_comprehension_loss = criterion_Q(child_recovers_from_adult, labels)
+                Q_comprehension_loss = criterion_Q(child_recovers_from_adult, labels[:,0:NUM_CATEG])
                 Q_comprehension_loss.backward()
                 wandb.log({"Loss/Q to Q": Q_comprehension_loss.detach().item()}, step=step)
                 optimizer_Q_to_Q.step()
@@ -654,35 +737,35 @@ if __name__ == "__main__":
                 t2 = time.time()
                 optimizer_D.zero_grad()                
 
-                epsilon = torch.rand(BATCH_SIZE, 1, 1).repeat(1, 1, SLICE_LEN).to(device)
+                epsilon = torch.rand(BATCH_SIZE, 1, 1, device=device).repeat(1, 1, SLICE_LEN)
                 
                 if ARCHITECTURE == "eiwgan":
                     # draw from the semantic space a c that will need to be encoded
                 
                     words = torch.nn.functional.one_hot(torch.randint(0, NUM_CATEG, (BATCH_SIZE,)),
                              num_classes=NUM_CATEG).detach().numpy() # randomly generate a bunch of one-hots
-                    word_indices = [x[1] for x in np.argwhere(words)]                                                                    
-
-                    # pre-draw the semantic vectors
-                    sem_vector_store = []
-                    for categ_index in range(NUM_CATEG):                            
-                        sem_vector_store.append(scipy.stats.multivariate_normal.rvs( mean=word_means[categ_index], cov=sigma, size=BATCH_SIZE))
-
-                    # draw a c from the pre-drawn params
-                    # draw the jth item from the ith word (many will not get used)
-                    c =  torch.from_numpy(np.vstack([sem_vector_store[i][j,:] for i,j in zip(word_indices, range(BATCH_SIZE))]).astype(np.float32)).to(device)                         
-                    _z = torch.FloatTensor(BATCH_SIZE, 100 - NUM_DIM).uniform_(-1, 1).to(device)                    
+                    word_indices = [x[1] for x in np.argwhere(words)]                                                                                       
+                    c = sample_multivatiate_normal(word_indices, word_means, sigma, NUM_CATEG, BATCH_SIZE)
+                    _z = torch_uniform([BATCH_SIZE, 100 - NUM_DIM], -1,1, device) 
                     z = torch.cat((c, _z), dim=1)
 
-                elif ARCHITECTURE in {'ciwgan', 'fiwgan'}: 
+
+                elif ARCHITECTURE == 'ciwgan':
                     c = get_architecture_appropriate_c(ARCHITECTURE, NUM_CATEG, BATCH_SIZE)
-                    _z = torch.FloatTensor(BATCH_SIZE, 100 - (NUM_CATEG)).uniform_(-1, 1).to(device)
+                    _z = torch_uniform([BATCH_SIZE, 100 - (NUM_CATEG + 1)], -1, 1, device)                    
+                    zeros = torch.zeros([BATCH_SIZE,1], device = device)
+                    z = torch.cat((c, zeros, _z), dim=1)
+                elif ARCHITECTURE == 'fiwgan': 
+                    c = get_architecture_appropriate_c(ARCHITECTURE, NUM_CATEG, BATCH_SIZE)
+                    _z = torch_uniform([BATCH_SIZE, 100 - NUM_CATEG], -1, 1, device)
                     z = torch.cat((c, _z), dim=1)
+                else:
+                    raise NotImplementedError
                 
                 if args.synthesizer == "WavGAN":    
                     fakes = G(z)
                 elif args.synthesizer == "ArticulationGAN":    
-                    fakes = synthesize(EMA, G(z).permute(0, 2, 1), synthesis_config, step)
+                    fakes = synthesize(EMA, G(z).permute(0, 2, 1), synthesis_config, step)                    
              
                 # shuffle the reals so that the matched item for discrim is not necessarily from the same referent. This is because the GAN is learning to distinguish *unconditioned* draws from G with real examples                
                 shuffled_reals = reals[torch.randperm(reals.shape[0]),:,:]
@@ -714,21 +797,18 @@ if __name__ == "__main__":
                         words = torch.nn.functional.one_hot(torch.randint(0, NUM_CATEG, (BATCH_SIZE,)),
                              num_classes=NUM_CATEG).detach().numpy() # randomly generate a bunch of one-hots
                         word_indices = [x[1] for x in np.argwhere(words)]                                                                    
-
-                        # pre-draw the semantic vectors
-                        sem_vector_store = []
-                        for categ_index in range(NUM_CATEG):                            
-                            sem_vector_store.append(scipy.stats.multivariate_normal.rvs( mean=word_means[categ_index], cov=sigma, size=BATCH_SIZE))
-
-                        # draw a c from the pre-drawn params
-                        # draw the jth item from the ith word (many will not get used)
-                        c =  torch.from_numpy(np.vstack([sem_vector_store[i][j,:] for i,j in zip(word_indices, range(BATCH_SIZE))]).astype(np.float32)).to(device)                         
-                        _z = torch.FloatTensor(BATCH_SIZE, 100 - NUM_DIM).uniform_(-1, 1).to(device)                    
+                        c = sample_multivatiate_normal(word_indices, word_means, sigma, NUM_CATEG, BATCH_SIZE)
+                        _z = torch_uniform([BATCH_SIZE, 100 - NUM_DIM], -1,1, device)                    
                         z = torch.cat((c, _z), dim=1)
-                    elif ARCHITECTURE in {'ciwgan', 'fiwgan'}:
+                    elif ARCHITECTURE == 'fiwgan':
                         c = get_architecture_appropriate_c(ARCHITECTURE, NUM_CATEG, BATCH_SIZE)
-                        _z = torch.FloatTensor(BATCH_SIZE, 100 - NUM_CATEG).uniform_(-1, 1).to(device)
+                        _z = torch_uniform([BATCH_SIZE, 100 - NUM_CATEG], -1, 1, device)
                         z = torch.cat((c, _z), dim=1)
+                    elif ARCHITECTURE == 'ciwgan':
+                        c = get_architecture_appropriate_c(ARCHITECTURE, NUM_CATEG, BATCH_SIZE)
+                        _z = torch_uniform([BATCH_SIZE, 100 - (NUM_CATEG + 1)], -1, 1, device)
+                        zeros = torch.zeros([BATCH_SIZE,1], device = device)
+                        z = torch.cat((c, zeros, _z), dim=1)
 
                     if args.synthesizer == "WavGAN":
                         G_z_for_G_update = G(z) # generate again using the same labels
@@ -770,41 +850,21 @@ if __name__ == "__main__":
                         optimizer_Q2_to_QG.zero_grad() # clear the gradients for the Q update
 
                         selected_candidate_wavs = []  
-                        mixed_selected_candidate_wavs = []                      
                         selected_Q_estimates = []
-                        mixed_selected_Q_estimates = []
 
                         print('Choosing '+str(Q2_BATCH_SIZE)+' best candidates for each word...')
 
-                        if ARCHITECTURE in {'ciwgan', 'fiwgan'}:
-                            if ARCHITECTURE == 'ciwgan':
-                                predicted_value_loss = torch.nn.CrossEntropyLoss()
-                            else:
-                                predicted_value_loss = torch.nn.BCEWithLogitsLoss()
-
+                        if ARCHITECTURE == 'ciwgan':
+                            predicted_value_loss = torch.nn.CrossEntropyLoss()
                             selected_referents = []
                             for categ_index in range(NUM_CATEG):
                                 
                                 num_candidates_to_consider_per_word = 1 # increasing this breaks stuff. Results in considering a larger space
 
-                                def mask_for_random_vectors(original_label, vocab_size, batch_size, q2_noise_probability):
-                                    # Get random vectors and prepare for mask
-                                    random_labels = torch.from_numpy(np.random.choice(np.arange(vocab_size), size = (batch_size,)))
-                                    mask_by_batch_dim = torch.from_numpy(np.random.choice([0, 1], size = (batch_size,), p = [1 - q2_noise_probability, q2_noise_probability]))
-                                    labels = torch.where(mask_by_batch_dim == 1, random_labels, original_label)
-                                    onehot_per_word = F.one_hot(labels, num_classes = vocab_size)    
-                                    assert len(onehot_per_word.shape) == 2
-                                    candidate_referents = onehot_per_word.unsqueeze(1).repeat((1, num_candidates_to_consider_per_word, 1)).reshape(-1, onehot_per_word.shape[-1])
-                                    return candidate_referents
-
                                 # generate a large numver of possible candidates
-                                candidate_referents = np.zeros([Q2_BATCH_SIZE*num_candidates_to_consider_per_word, NUM_CATEG], dtype=np.float32)
-                                candidate_referents[:,categ_index] = 1     
-                                candidate_referents = torch.Tensor(candidate_referents).to(device)
-                                _z = torch.FloatTensor(Q2_BATCH_SIZE*num_candidates_to_consider_per_word, 100 - (NUM_CATEG)).uniform_(-1, 1).to(device)
-
-                                # possible candidated but mixed
-                                mixed_candidate_referents = mask_for_random_vectors(categ_index, len(vocab), Q2_BATCH_SIZE, args.q2_noise_probability).to(device)
+                                candidate_referents = torch.zeros([Q2_BATCH_SIZE*num_candidates_to_consider_per_word, NUM_CATEG+1], device=device)
+                                candidate_referents[:,categ_index] = 1                                     
+                                _z = torch_uniform([Q2_BATCH_SIZE*num_candidates_to_consider_per_word, 100 - (NUM_CATEG + 1)], -1, 1, device)                                
 
                                 # generate new candidate wavs
                                 if args.synthesizer == "WavGAN":
@@ -815,13 +875,8 @@ if __name__ == "__main__":
                                 #     with record_function("Q decoding in utt selection"):
                                 candidate_Q_estimates = Q(candidate_wavs)
 
-                                # generate new mixed candidate wavs
-                                mixed_candidate_wavs = G(torch.cat((mixed_candidate_referents, _z), dim=1))
-                                mixed_candidate_Q_estimates = Q(mixed_candidate_wavs)
-
-
                                 # select the Q2_BATCH_SIZE items that are most likely to produce the correct response
-                                candidate_predicted_values = torch.Tensor([predicted_value_loss(candidate_Q_estimates[i], candidate_referents[i]) for i in range(candidate_referents.shape[0])])                                
+                                candidate_predicted_values = torch.Tensor([predicted_value_loss(candidate_Q_estimates[i], candidate_referents[i,0:NUM_CATEG]) for i in range(candidate_referents.shape[0])])                                
                                 # order by their predicted score
                                 candidate_ordering = torch.argsort(candidate_predicted_values, dim=- 1, descending=False, stable=False)
 
@@ -829,10 +884,6 @@ if __name__ == "__main__":
                                 selected_candidate_wavs.append(torch.narrow(candidate_wavs[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE)[:,0].clone())
                                 selected_referents.append(torch.narrow(candidate_referents[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE).clone())
                                 selected_Q_estimates.append(torch.narrow(candidate_Q_estimates[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE).clone())
-
-                                # select mixed candidates that correspond to that subset
-                                mixed_selected_candidate_wavs.append(torch.narrow(mixed_candidate_wavs[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE)[:,0].clone())
-                                mixed_selected_Q_estimates.append(torch.narrow(mixed_candidate_Q_estimates[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE).clone())
 
                                 del candidate_referents
                                 del candidate_wavs
@@ -846,8 +897,49 @@ if __name__ == "__main__":
                             selected_referents =  torch.vstack(selected_referents)
                             selected_Q_estimates = torch.vstack(selected_Q_estimates)  
 
-                            mixed_selected_candidate_wavs = torch.vstack(mixed_selected_candidate_wavs)
-                            mixed_selected_Q_estimates = torch.vstack(mixed_selected_Q_estimates)
+                        if ARCHITECTURE == 'fiwgan':
+                            predicted_value_loss = torch.nn.BCEWithLogitsLoss()
+                            selected_referents = []
+                            for categ_index in range(NUM_CATEG):
+                                
+                                num_candidates_to_consider_per_word = 1 # increasing this breaks stuff. Results in considering a larger space
+
+                                # generate a large numver of possible candidates
+                                candidate_referents = np.zeros([Q2_BATCH_SIZE*num_candidates_to_consider_per_word, NUM_CATEG], dtype=np.float32)
+                                candidate_referents[:,categ_index] = 1     
+                                candidate_referents = torch.from_numpy(candidate_referents).to(device)                                
+                                _z = torch_uniform([Q2_BATCH_SIZE*num_candidates_to_consider_per_word, 100 - NUM_CATEG], -1, 1, device)
+
+
+                                # generate new candidate wavs
+                                if args.synthesizer == "WavGAN":
+                                    candidate_wavs = G(torch.cat((candidate_referents, _z), dim=1))
+                                elif args.synthesizer == "ArticulationGAN":
+                                    candidate_wavs = synthesize(EMA, G(torch.cat((candidate_referents, _z), dim=1)).permute(0, 2, 1), synthesis_config)                                
+
+                                candidate_Q_estimates = Q(candidate_wavs)
+
+                                # select the Q2_BATCH_SIZE items that are most likely to produce the correct response
+                                candidate_predicted_values = torch.Tensor([predicted_value_loss(candidate_Q_estimates[i], candidate_referents[i,0:NUM_CATEG]) for i in range(candidate_referents.shape[0])])                                
+                                # order by their predicted score
+                                candidate_ordering = torch.argsort(candidate_predicted_values, dim=- 1, descending=False, stable=False)
+
+                                # select a subset of the candidates
+                                selected_candidate_wavs.append(torch.narrow(candidate_wavs[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE)[:,0].clone())
+                                selected_referents.append(torch.narrow(candidate_referents[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE).clone())
+                                selected_Q_estimates.append(torch.narrow(candidate_Q_estimates[candidate_ordering,:], dim=0, start=0, length=Q2_BATCH_SIZE).clone())
+
+                                del candidate_referents
+                                del candidate_wavs
+                                del candidate_Q_estimates
+                                gc.collect()
+                                torch.cuda.empty_cache()
+
+                            print('collapsing candidates')
+                            selected_candidate_wavs = torch.vstack(selected_candidate_wavs)
+                            selected_referents =  torch.vstack(selected_referents)
+                            selected_Q_estimates = torch.vstack(selected_Q_estimates)  
+                        
                         elif ARCHITECTURE == 'eiwgan':                            
                             
                             selected_meanings = []
@@ -858,21 +950,20 @@ if __name__ == "__main__":
                                 num_candidates_to_consider_per_word = 1 
 
                                 # propagae the categorical label associated with the Gaussian for checking what Q2 infers
-                                candidate_referents = np.zeros([Q2_BATCH_SIZE*num_candidates_to_consider_per_word, NUM_CATEG], dtype=np.float32)
-                                candidate_referents[:,categ_index] = 1
-                                candidate_referents = torch.Tensor(candidate_referents).to(device)
+                                candidate_referents = torch.zeros([Q2_BATCH_SIZE*num_candidates_to_consider_per_word, NUM_CATEG+1], device=device)
+                                candidate_referents[:,categ_index] = 1                                
 
-                                c = scipy.stats.multivariate_normal.rvs(mean=word_means[categ_index], cov=sigma, size=Q2_BATCH_SIZE * num_candidates_to_consider_per_word)
-                                
+                                print('check if multivaraite sampleing is working')
+                                                                
                                 #candidate_meanings rather than candidate references                                
-                                candidate_meanings = torch.Tensor(c).to(device)
-                                _z = torch.FloatTensor(Q2_BATCH_SIZE*num_candidates_to_consider_per_word, 100 - NUM_DIM).uniform_(-1, 1).to(device)
+                                candidate_meanings = sample_multivatiate_normal_for_categ(categ_index, word_means, sigma, Q2_BATCH_SIZE*num_candidates_to_consider_per_word)
+                                _z = torch_uniform([Q2_BATCH_SIZE*num_candidates_to_consider_per_word, 100 - NUM_DIM], -1,1, device) 
 
                                 # generate new candidate wavs
                                 if args.synthesizer == "WavGAN":
                                     candidate_wavs = G(torch.cat((candidate_meanings, _z), dim=1))
-                                elif args.synthesizer == "ArticulationGAN":
-                                    candidate_wavs = synthesize(EMA, G(torch.cat((candidate_meanings, _z), dim=1)).permute(0, 2, 1), synthesis_config, step)
+                                elif args.synthesizer == "ArticulationGAN":                                        
+                                    candidate_wavs = synthesize(EMA, G(torch.hstack([candidate_meanings, _z])).permute(0, 2, 1), synthesis_config, step)
 
                                 candidate_Q_estimates = Q(candidate_wavs)
 
@@ -909,54 +1000,63 @@ if __name__ == "__main__":
                         time_checkpoint(t8, t9, 'Utterance selection', step)                        
 
 
-                        print('Recognizing G output with Q2 model...')                        
-                        t10 = time.time()
-                        if ARCHITECTURE in {"ciwgan", "fiwgan"}:
-                            with torch.no_grad():
-                                Q2_probs = Q2_cnn(selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE)
-                            mixed_Q2_probs = Q2_cnn(mixed_selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE)
-                            Q_prediction = torch.softmax(selected_Q_estimates, dim=1)
+                        print('Recognizing G output with Q2 model...')
+                        t10 = time.time()                        
 
-
-                        elif ARCHITECTURE == "eiwgan":
-
-                            # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:                        
-                            #     with record_function("Q2 decoding in outer loop"):
-                            Q2_sem_vecs = Q2_cnn(selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE) 
-                            Q_prediction = selected_Q_estimates
-                            
-                        #assert(Q2_probs.shape[1] == NUM_CATEG+1)
                         
-                        print('Comparing Q predictions to Q2 output')        
-                        #Q2_output = torch.from_numpy(Q2_probs.astype(np.float32)).to(device) 
+                        Q2_features = Q2_cnn(selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE)
+                        assert len(Q2_features.shape) == 2
+                        replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], Q2_features.shape[1], device)
+                        mixed_Q2_features = add_noise_to_label(Q2_features, replacement_features, args.q2_noise_probability, device)
 
-                        # Q_of_selected_candidates is the expected value of each utterance
-                    
+                        if ARCHITECTURE == 'ciwgan':
+                            mixed_indices_of_recognized_words = get_non_UNK_in_Q2_ciwgan(mixed_Q2_features, SELECTION_THRESHOLD, device)
+                            pure_indices_of_recognized_words = get_non_UNK_in_Q2_ciwgan(Q2_features, SELECTION_THRESHOLD, device)
+                        
+                        elif ARCHITECTURE == 'fiwgan':
+                            mixed_indices_of_recognized_words = get_non_UNK_in_Q2_fiwgan(mixed_Q2_features, SELECTION_THRESHOLD, device)
+                            pure_indices_of_recognized_words = get_non_UNK_in_Q2_fiwgan(Q2_features, SELECTION_THRESHOLD, device)
+                        
+                        elif ARCHITECTURE == "eiwgan":                            
+                            mixed_indices_of_recognized_words = get_non_UNK_in_Q2_eiwgan(mixed_Q2_features, word_means, SELECTION_THRESHOLD, device)
+                            pure_indices_of_recognized_words = get_non_UNK_in_Q2_eiwgan(Q2_features, word_means, SELECTION_THRESHOLD, device)
+                        else:
+                            raise NotImplementedError
+                        
+                        total_recognized_words = len(pure_indices_of_recognized_words)
 
-                        if ARCHITECTURE in ('ciwgan', 'fiwgan'):
-                            mixed_Q_prediction = torch.softmax(mixed_selected_Q_estimates, dim=1)
-                                
-                        # this is a one shot game for each reference, so implicitly the value before taking the action is 0. I might update this later, i.e., think about this in terms of sequences                   
-                                                
-                        # compute the cross entropy between the Q network and the Q2 outputs, which are class labels recovered by the adults                                                    
-                        if ARCHITECTURE in {'ciwgan', 'fiwgan'}:    
-                            augmented_Q_prediction = torch.log(Q_prediction + .0000001)   
-                            mixed_augmented_Q_prediction = torch.log(mixed_Q_prediction + .0000001)                          
+                        if len(mixed_indices_of_recognized_words) > 0:
                             
-                            mixed_Q2_loss = criterion_Q2(mixed_augmented_Q_prediction, mixed_Q2_probs)   
-                            with torch.no_grad():
-                                Q2_loss = criterion_Q2(augmented_Q_prediction, Q2_probs)   
+                            print('Comparing Q predictions to Q2 output')        
 
-                            if ARCHITECTURE == 'ciwgan':
-                                # is the Q prediction the same as selected_referents?                            
+                            # Q_of_selected_candidates is the expected value of each utterance
+
+                            Q_prediction = torch.softmax(selected_Q_estimates, dim=1)  
+                            zero_tensor = torch.zeros(selected_Q_estimates.shape[0],1, device=device)  # for padding the UNKs, in logit space                              
+    
+                            # this is a one shot game for each reference, so implicitly the value before taking the action is 0. I might update this later, i.e., think about this in terms of sequences                   
+                                                    
+                            # compute the cross entropy between the Q network and the Q2 outputs, which are class labels recovered by the adults                                                    
+                            if ARCHITECTURE == 'ciwgan':    
+                                augmented_Q_prediction = torch.log(torch.hstack((Q_prediction, zero_tensor)) + .0000001)
+                                
+                                mixed_Q2_loss = criterion_Q2(augmented_Q_prediction[mixed_indices_of_recognized_words], mixed_Q2_features[mixed_indices_of_recognized_words])   
+                                with torch.no_grad():
+                                    Q2_loss = criterion_Q2(augmented_Q_prediction[pure_indices_of_recognized_words], Q2_features[pure_indices_of_recognized_words])   
+
                                 if not torch.equal(torch.argmax(selected_referents, dim=1), torch.argmax(Q_prediction, dim =1)):
                                     print("Child model produced an utterance that they don't think will invoke the correct action. Consider choosing action from a larger set of actions. Disregard if this is early in training and the Q network is not trained yet.")
 
                                 # count the number of words that Q recovers the same thing as Q2
-                                Q_recovers_Q2 = torch.eq(torch.argmax(augmented_Q_prediction, dim=1), torch.argmax(Q2_probs, dim=1)).cpu().numpy().tolist()
-                                Q2_recovers_child = torch.eq(torch.argmax(selected_referents, dim=1), torch.argmax(Q2_probs, dim=1)).cpu().numpy().tolist()
-                            else:
+                                Q_recovers_Q2 = torch.eq(torch.argmax(augmented_Q_prediction[pure_indices_of_recognized_words], dim=1), torch.argmax(Q2_probs[pure_indices_of_recognized_words], dim=1)).cpu().numpy().tolist()
+                                Q2_recovers_child = torch.eq(torch.argmax(selected_referents[pure_indices_of_recognized_words], dim=1), torch.argmax(Q2_probs[pure_indices_of_recognized_words], dim=1)).cpu().numpy().tolist()
 
+                            elif ARCHITECTURE == 'fiwgan':
+
+                                augmented_Q_prediction = torch.log(Q_prediction + .0000001)   
+                                mixed_Q2_loss = criterion_Q2(augmented_Q_prediction[mixed_indices_of_recognized_words], mixed_Q2_features[mixed_indices_of_recognized_words])   
+                                with torch.no_grad():
+                                    Q2_loss = criterion_Q2(augmented_Q_prediction[pure_indices_of_recognized_words], Q2_features[pure_indices_of_recognized_words])   
                                 def count_binary_vector_matches(raw_set1, raw_set2):
                                     matches_mask = []
                                     threshold = 0.5
@@ -968,72 +1068,88 @@ if __name__ == "__main__":
                                         matches_mask.append(match_int)
                                     return matches_mask
 
-                                Q_recovers_Q2 = count_binary_vector_matches(augmented_Q_prediction, Q2_probs)
-                                Q2_recovers_child = count_binary_vector_matches(selected_referents, Q2_probs)
-                        
-                        elif ARCHITECTURE == 'eiwgan':                                                            
-
-                            embeddings_path = os.path.join(logdir,'meaning_embeddings')
-                            if not os.path.exists(embeddings_path):
-                                os.makedirs(embeddings_path)
-
-                            #'Write out the initial vectors, the Q predictions, and the Q2 interpretations
-                            pd.DataFrame(selected_meanings.detach().cpu().numpy()).to_csv(os.path.join(embeddings_path,str(epoch)+'_selected_meaning.csv'))
-                            pd.DataFrame(Q_prediction.detach().cpu().numpy()).to_csv(os.path.join(embeddings_path,str(epoch)+'_Q_prediction.csv'))
-                            pd.DataFrame(Q2_sem_vecs.detach().cpu().numpy()).to_csv(os.path.join(embeddings_path,str(epoch)+'_Q2_sem_vecs.csv'))
-
-                            Q2_loss = torch.mean(criterion_Q2(Q_prediction, Q2_sem_vecs))                                
-                            print('Check if we recover the one-hot that was used to draw the continuously valued vector')                                
-                            Q2_recovers_child = torch.eq(torch.argmax(selected_referents, dim=1), one_hot_classify_sem_vector(Q2_sem_vecs, word_means)).cpu().numpy().tolist()                                
-                                                                                                                
-                        #this is where we would compute the loss
-                        if args.backprop_from_Q2:
-                            if ARCHITECTURE in ('ciwgan', 'fiwgan'):
-                                mixed_Q2_loss.backward(retain_graph=True)
-                            elif ARCHITECTURE == 'eiwgan':
-                                Q2_loss.backward(retain_graph=True)
-                            else:
-                                raise NotImplementedError
-                        else:
-                            print('Computing Q2 network loss but not backpropagating...')
+                                Q_recovers_Q2 = count_binary_vector_matches(augmented_Q_prediction[pure_indices_of_recognized_words], Q2_probs[pure_indices_of_recognized_words])
+                                Q2_recovers_child = count_binary_vector_matches(selected_referents[pure_indices_of_recognized_words], Q2_probs[pure_indices_of_recognized_words])
                             
-                        print('Gradients on the Q network:')
-                        print('Q layer 0: '+str(np.round(torch.sum(torch.abs(Q.downconv_0.conv.weight.grad)).cpu().numpy(), 10)))
-                        print('Q layer 1: '+str(np.round(torch.sum(torch.abs(Q.downconv_1.conv.weight.grad)).cpu().numpy(), 10)))
-                        print('Q layer 2: '+str(np.round(torch.sum(torch.abs(Q.downconv_2.conv.weight.grad)).cpu().numpy(), 10)))
-                        print('Q layer 3: '+str(np.round(torch.sum(torch.abs(Q.downconv_3.conv.weight.grad)).cpu().numpy(), 10)))
-                        print('Q layer 4: '+str(np.round(torch.sum(torch.abs(Q.downconv_4.conv.weight.grad)).cpu().numpy(), 10)))
+                            elif ARCHITECTURE == 'eiwgan':                                                            
 
-                        #print('Q2 -> Q update!')
-                        #this is where we would do the step
-                        if args.backprop_from_Q2:
-                            print('Q2 -> Q update!')
-                            optimizer_Q2_to_QG.step()
-                        optimizer_Q2_to_QG.zero_grad()
+                                embeddings_path = os.path.join(logdir,'meaning_embeddings')
+                                if not os.path.exists(embeddings_path):
+                                    os.makedirs(embeddings_path)
 
-                        total_Q2_recovers_child = np.sum(Q2_recovers_child)
+                                #'Write out the initial vectors, the Q predictions, and the Q2 interpretations
+                                pd.DataFrame(selected_meanings.detach().cpu().numpy()).to_csv(os.path.join(embeddings_path,str(epoch)+'_selected_meaning.csv'))
+                                pd.DataFrame(Q_prediction.detach().cpu().numpy()).to_csv(os.path.join(embeddings_path,str(epoch)+'_Q_prediction.csv'))
+                                pd.DataFrame(Q2_features.detach().cpu().numpy()).to_csv(os.path.join(embeddings_path,str(epoch)+'_Q2_sem_vecs.csv'))
 
-                        if ARCHITECTURE in ('ciwgan', 'fiwgan'):
-                            total_Q_recovers_Q2 = np.sum(Q_recovers_Q2)                                                            
+                                Q2_loss = torch.mean(criterion_Q2(Q_prediction[mixed_indices_of_recognized_words], Q2_sem_vecs[mixed_indices_of_recognized_words]))                                
+                                print('Check if we recover the one-hot that was used to draw the continuously valued vector')                                
+                                Q2_recovers_child = torch.eq(torch.argmax(selected_referents[pure_indices_of_recognized_words], dim=1), one_hot_classify_sem_vector(Q2_sem_vecs[pure_indices_of_recognized_words], word_means)).cpu().numpy().tolist()                                
+                                                                                                                    
+                            #this is where we would compute the loss
+                            if args.backprop_from_Q2:
+                                if ARCHITECTURE in ('ciwgan', 'fiwgan'):
+                                    mixed_Q2_loss.backward(retain_graph=True)
+                                elif ARCHITECTURE == 'eiwgan':
+                                    Q2_loss.backward(retain_graph=True)
+                                else:
+                                    raise NotImplementedError
+                            else:
+                                print('Computing Q2 network loss but not backpropagating...')
+                                
+                            print('Gradients on the Q network:')
+                            print('Q layer 0: '+str(np.round(torch.sum(torch.abs(Q.downconv_0.conv.weight.grad)).cpu().numpy(), 10)))
+                            print('Q layer 1: '+str(np.round(torch.sum(torch.abs(Q.downconv_1.conv.weight.grad)).cpu().numpy(), 10)))
+                            print('Q layer 2: '+str(np.round(torch.sum(torch.abs(Q.downconv_2.conv.weight.grad)).cpu().numpy(), 10)))
+                            print('Q layer 3: '+str(np.round(torch.sum(torch.abs(Q.downconv_3.conv.weight.grad)).cpu().numpy(), 10)))
+                            print('Q layer 4: '+str(np.round(torch.sum(torch.abs(Q.downconv_4.conv.weight.grad)).cpu().numpy(), 10)))
 
-                        wandb.log({"Loss/Q2 to Q": Q2_loss.detach().item()}, step=step)
+                            #print('Q2 -> Q update!')
+                            #this is where we would do the step
+                            if args.backprop_from_Q2:
+                                print('Q2 -> Q update!')
+                                optimizer_Q2_to_QG.step()
+                            optimizer_Q2_to_QG.zero_grad()
+
+                            total_Q2_recovers_child = np.sum(Q2_recovers_child)
+
+                            if ARCHITECTURE in ('ciwgan', 'fiwgan'):
+                                total_Q_recovers_Q2 = np.sum(Q_recovers_Q2)                                                            
+
+                            wandb.log({"Loss/Q2 to Q": Q2_loss.detach().item()}, step=step)
                         
+                        if len(pure_indices_of_recognized_words) == 0:
+                            if ARCHITECTURE in ('eiwgan','ciwgan'):
+                                total_Q2_recovers_child = 0
+                            if ARCHITECTURE  == 'ciwgan':
+                                total_Q_recovers_Q2 = 0
+
                         wandb.log({"Metric/Number of Referents Recovered by Q2": total_Q2_recovers_child}, step=step)
 
                         if ARCHITECTURE  in ('ciwgan', 'fiwgan'):
                             # How often does the Q network repliacte the Q2 network
                             wandb.log({"Metric/Number of Q2 references replicated by Q": total_Q_recovers_Q2}, step=step)
+                            wandb.log({"Metric/Proportion Recognized Words Among Total": total_recognized_words / (Q2_BATCH_SIZE *NUM_CATEG)}, step=step) 
+
+
                         t11 = time.time()                        
                         time_checkpoint(t10, t11, 'adult evaluation', step)
+                        
 
-                    t12 = time.time()                                      
+                   
                     if label_stages:
                         print('Q -> G, Q update')
+                    t12 = time.time()
 
-
-                    if ARCHITECTURE in ("ciwgan", "fiwgan"):
+                    if ARCHITECTURE == 'ciwgan':
                         c = get_architecture_appropriate_c(ARCHITECTURE, NUM_CATEG, BATCH_SIZE)
-                        _z = torch.FloatTensor(BATCH_SIZE, 100 - NUM_CATEG).uniform_(-1, 1).to(device)
+                        _z = torch_uniform([BATCH_SIZE, 100 - (NUM_CATEG + 1)], -1, 1, device)
+                        zeros = torch.zeros([BATCH_SIZE,1], device = device)
+                        z = torch.cat((c, zeros, _z), dim=1)
+
+                    if ARCHITECTURE == 'fiwgan':
+                        c = get_architecture_appropriate_c(ARCHITECTURE, NUM_CATEG, BATCH_SIZE)
+                        _z = torch_uniform([BATCH_SIZE, 100 - NUM_CATEG], -1, 1, device)
                         z = torch.cat((c, _z), dim=1)
                     
                     elif ARCHITECTURE == "eiwgan":
@@ -1042,16 +1158,8 @@ if __name__ == "__main__":
                         words = torch.nn.functional.one_hot(torch.randint(0, NUM_CATEG, (BATCH_SIZE,)),
                              num_classes=NUM_CATEG).detach().numpy() # randomly generate a bunch of one-hots
                         word_indices = [x[1] for x in np.argwhere(words)]                                                                    
-
-                        # pre-draw the semantic vectors
-                        sem_vector_store = []
-                        for categ_index in range(NUM_CATEG):                            
-                            sem_vector_store.append(scipy.stats.multivariate_normal.rvs( mean=word_means[categ_index], cov=sigma, size=BATCH_SIZE))
-
-                        # draw a c from the pre-drawn params
-                        # draw the jth item from the ith word (many will not get used)
-                        c =  torch.from_numpy(np.vstack([sem_vector_store[i][j,:] for i,j in zip(word_indices, range(BATCH_SIZE))]).astype(np.float32)).to(device)                         
-                        _z = torch.FloatTensor(BATCH_SIZE, 100 - NUM_DIM).uniform_(-1, 1).to(device)                    
+                        c = sample_multivatiate_normal(word_indices, word_means, sigma, NUM_CATEG, BATCH_SIZE)
+                        _z = torch_uniform([BATCH_SIZE, 100 - NUM_DIM], -1,1, device)
                         z = torch.cat((c, _z), dim=1)                            
                     
                     if args.synthesizer == "WavGAN":
@@ -1067,15 +1175,15 @@ if __name__ == "__main__":
 
                     elif ARCHITECTURE in {"ciwgan", "fiwgan"}:
                                                 
-                        Q_production_loss = criterion_Q(Q(G_z_for_Q_update), c)
+                        Q_production_loss = criterion_Q(Q(G_z_for_Q_update), c[:,0:NUM_CATEG])
 
                     Q_production_loss.backward()
                     wandb.log({"Loss/Q to G": Q_production_loss.detach().item()}, step=step)
                     optimizer_Q_to_QG.step()
                     optimizer_Q_to_QG.zero_grad()
 
-                t13 = time.time()
-                time_checkpoint(t12, t13, 'Q -> G update', step) 
+                    t13 = time.time()
+                    time_checkpoint(t12, t13, 'Q -> G update', step) 
                 
                 t16 = time.time()
                 time_checkpoint(t2, t16, 'Step duration', step)
@@ -1097,6 +1205,8 @@ if __name__ == "__main__":
                 articul = articul_out[0,i,:].cpu().detach().numpy()                    
                 plt.plot(range(len(articul)), articul)
                 plt.savefig(os.path.join(artic_path, "articulation_channel_"+str(i)+".png"))
+                plt.close()
+
             t15 = time.time()
             time_checkpoint(t14, t15, 'Artic images', epoch)                 
 
