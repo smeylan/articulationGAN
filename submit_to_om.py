@@ -99,7 +99,7 @@ if __name__ == "__main__":
         models_to_run.append(run_model_spec)
 
 
-    singularity_base_command = "singularity exec -B /om2/user/$USER --env PYTHONPATH=/usr/local/lib/python3.8/dist-packages,WANDB_API_KEY=${WANDB_API_KEY} --nv /om2/user/smeylan/vagrant/menll_pytorch.sbx python3"
+    singularity_base_command = "singularity exec -B /om2/user/$USER --env PYTHONPATH=/usr/local/lib/python3.8/dist-packages,WANDB_API_KEY=${WANDB_API_KEY} --nv /om2/user/wongn/om2_mount/child-acq/menll-pytorch-agan.sbx python3"
 
     model_file_paths = [gen_one_model_submission_script(model, singularity_base_command, model_spec['slurm']) for model in models_to_run]
     

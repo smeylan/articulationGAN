@@ -173,8 +173,8 @@ def get_non_UNK_in_Q2_fiwgan(Q_network_features, threshold, device):
     return indices_of_recognized_words
 
 def get_non_UNK_in_Q2_eiwgan(Q_network_features, word_means, threshold, device):
-    distances = get_sem_vector_distance_to_means(Q2_network_features, word_means)
-    best = torch.min(distances, 0)
+    distances = get_sem_vector_distance_to_means(Q_network_features, word_means)
+    best = torch.min(distances, 0).values
     assert best.shape == (Q_network_features.shape[0],)
     indices_of_recognized_words = torch.argwhere( best <= torch.Tensor([threshold]).to(device)).flatten()
     return indices_of_recognized_words
@@ -201,27 +201,31 @@ class EuclideanLoss(nn.Module):
     def forward(self, inputs, targets):
         return torch.sqrt(torch.sum((inputs - targets) ** 2, dim=1))
 
-def get_replacement_features(architecture, num_examples, feature_size):
+def get_replacement_features(architecture, num_examples, feature_size, device):
+    return_tensor = None
     if architecture == 'ciwgan':
         random_labels = torch.randint(low=0, high=vocab_size, size = (num_examples,))
         onehot_per_word = F.one_hot(random_labels, num_classes = vocab_size)
-        return onehot_per_word
+        return_tensor = onehot_per_word
     elif architecture == 'fiwgan':
         # high parameter is exclusive
-        return torch.randint(low=0, high=2, size = (num_examples, feature_size))   
+        return_tensor = torch.randint(low=0, high=2, size = (num_examples, feature_size))   
     elif architecture == 'eiwgan':
         output_shape = (num_examples, feature_size)
         high = torch.ones(output_shape) 
         low = high * -1
-        return torch.distributions.Uniform(low, high + 1e-8).sample()
+        return_tensor = torch.distributions.Uniform(low, high + 1e-8).sample()
     else:
         raise NotImplementedError
+    
+    return return_tensor.to(device)
 
-def add_noise_to_label(original_features, replacement_features, q2_noise_probability):
+def add_noise_to_label(original_features, replacement_features, q2_noise_probability, device):
     assert original_features.shape == replacement_features.shape
     assert len(original_features.shape) == 2
     mask_by_example_dim = torch.bernoulli(torch.ones(original_features.shape[0]).fill_(q2_noise_probability))
-    mask_features = mask_by_example_dim.unsqueeze(1).repeat(1, original_features.shape[-1]).int()
+    mask_features = mask_by_example_dim.unsqueeze(1).repeat(1, original_features.shape[-1]).int().to(device)
+
     candidate_referents = torch.where(mask_features == 1, replacement_features, original_features)
     return candidate_referents
 
@@ -488,7 +492,7 @@ if __name__ == "__main__":
     SAVE_INT = args.save_int
     PRODUCTION_START_EPOCH = args.production_start_epoch
     COMPREHENSION_INTERVAL = args.comprehension_interval
-
+    SELECTION_THRESHOLD = args.q2_unk_threshold
 
     #Sizes of things
     SLICE_LEN = args.slice_len
@@ -968,20 +972,20 @@ if __name__ == "__main__":
                         print('Recognizing G output with Q2 model...')                        
                         
                         Q2_features = Q2_cnn(selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE)
-                        assert len(Q2_probs.shape) == 2
-                        replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], Q2_probs.shape[1])
-                        mixed_Q2_features = add_noise_to_label(Q2_features, replacement_features, args.q2_noise_probability)
+                        assert len(Q2_features.shape) == 2
+                        replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], Q2_features.shape[1], device)
+                        mixed_Q2_features = add_noise_to_label(Q2_features, replacement_features, args.q2_noise_probability, device)
 
                         if ARCHITECTURE == 'ciwgan':
-                            mixed_indices_of_recognized_words = get_non_UNK_in_Q2_ciwgan(mixed_Q2_features, Q2_ENTROPY_THRESHOLD, device)
-                            pure_indices_of_recognized_words = get_non_UNK_in_Q2_ciwgan(Q2_features, Q2_ENTROPY_THRESHOLD, device)
+                            mixed_indices_of_recognized_words = get_non_UNK_in_Q2_ciwgan(mixed_Q2_features, SELECTION_THRESHOLD, device)
+                            pure_indices_of_recognized_words = get_non_UNK_in_Q2_ciwgan(Q2_features, SELECTION_THRESHOLD, device)
                         elif ARCHITECTURE == 'fiwgan':
-                            mixed_indices_of_recognized_words = get_non_UNK_in_Q2_fiwgan(mixed_Q2_features, Q2_ENTROPY_THRESHOLD, device)
-                            pure_indices_of_recognized_words = get_non_UNK_in_Q2_fiwgan(Q2_features, Q2_ENTROPY_THRESHOLD, device)
+                            mixed_indices_of_recognized_words = get_non_UNK_in_Q2_fiwgan(mixed_Q2_features, SELECTION_THRESHOLD, device)
+                            pure_indices_of_recognized_words = get_non_UNK_in_Q2_fiwgan(Q2_features, SELECTION_THRESHOLD, device)
                         elif ARCHITECTURE == "eiwgan":
                             Q2_sem_vecs = Q2_cnn(selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE) 
-                            mixed_indices_of_recognized_words = get_non_UNK_in_Q2_eiwgan(mixed_Q2_features, word_means, Q2_ENTROPY_THRESHOLD, device)
-                            pure_indices_of_recognized_words = get_non_UNK_in_Q2_eiwgan(Q2_features, word_means, Q2_ENTROPY_THRESHOLD, device)
+                            mixed_indices_of_recognized_words = get_non_UNK_in_Q2_eiwgan(mixed_Q2_features, word_means, SELECTION_THRESHOLD, device)
+                            pure_indices_of_recognized_words = get_non_UNK_in_Q2_eiwgan(Q2_features, word_means, SELECTION_THRESHOLD, device)
                         else:
                             raise NotImplementedError
                         
