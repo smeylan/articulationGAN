@@ -100,7 +100,7 @@ def get_architecture_appropriate_c(architecture, num_categ, batch_size):
         c = torch.nn.functional.one_hot(torch.randint(0, num_categ, (batch_size,)),
                                                 num_classes=num_categ, device=device)
     elif ARCHITECTURE == 'fiwgan':
-        c = torch.tensor([batch_size, num_categ], device=device).bernoulli_()
+        c = torch.zeros([batch_size, num_categ], device=device).bernoulli_()
     else:
         assert False, "Architecture not recognized."
     return c
@@ -563,12 +563,11 @@ if __name__ == "__main__":
         sigma = np.matrix([[.025,0],[0,.025]])
         
         dataset = AudioDataSet(datadir, SLICE_LEN, NUM_CATEG, vocab, word_means, sigma)
+
+        word_means = torch.from_numpy(word_means).to(device)
+        sigma = torch.from_numpy(sigma).to(device) 
     else:
         dataset = AudioDataSet(datadir, SLICE_LEN, NUM_CATEG, vocab)
-
-    word_means = torch.from_numpy(word_means).to(device)
-    sigma = torch.from_numpy(sigma).to(device) 
-
 
     dataloader = DataLoader(
         dataset,
@@ -915,7 +914,7 @@ if __name__ == "__main__":
                                 if args.synthesizer == "WavGAN":
                                     candidate_wavs = G(torch.cat((candidate_referents, _z), dim=1))
                                 elif args.synthesizer == "ArticulationGAN":
-                                    candidate_wavs = synthesize(EMA, G(torch.cat((candidate_referents, _z), dim=1)).permute(0, 2, 1), synthesis_config)                                
+                                    candidate_wavs = synthesize(EMA, G(torch.cat((candidate_referents, _z), dim=1)).permute(0, 2, 1), synthesis_config, step)                                
 
                                 candidate_Q_estimates = Q(candidate_wavs)
 
@@ -1009,6 +1008,7 @@ if __name__ == "__main__":
                         replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], Q2_features.shape[1], device)
                         mixed_Q2_features = add_noise_to_label(Q2_features, replacement_features, args.q2_noise_probability, device)
 
+
                         if ARCHITECTURE == 'ciwgan':
                             mixed_indices_of_recognized_words = get_non_UNK_in_Q2_ciwgan(mixed_Q2_features, SELECTION_THRESHOLD, device)
                             pure_indices_of_recognized_words = get_non_UNK_in_Q2_ciwgan(Q2_features, SELECTION_THRESHOLD, device)
@@ -1048,8 +1048,8 @@ if __name__ == "__main__":
                                     print("Child model produced an utterance that they don't think will invoke the correct action. Consider choosing action from a larger set of actions. Disregard if this is early in training and the Q network is not trained yet.")
 
                                 # count the number of words that Q recovers the same thing as Q2
-                                Q_recovers_Q2 = torch.eq(torch.argmax(augmented_Q_prediction[pure_indices_of_recognized_words], dim=1), torch.argmax(Q2_probs[pure_indices_of_recognized_words], dim=1)).cpu().numpy().tolist()
-                                Q2_recovers_child = torch.eq(torch.argmax(selected_referents[pure_indices_of_recognized_words], dim=1), torch.argmax(Q2_probs[pure_indices_of_recognized_words], dim=1)).cpu().numpy().tolist()
+                                Q_recovers_Q2 = torch.eq(torch.argmax(augmented_Q_prediction[pure_indices_of_recognized_words], dim=1), torch.argmax(Q2_features[pure_indices_of_recognized_words], dim=1)).cpu().numpy().tolist()
+                                Q2_recovers_child = torch.eq(torch.argmax(selected_referents[pure_indices_of_recognized_words], dim=1), torch.argmax(Q2_features[pure_indices_of_recognized_words], dim=1)).cpu().numpy().tolist()
 
                             elif ARCHITECTURE == 'fiwgan':
 
@@ -1068,8 +1068,8 @@ if __name__ == "__main__":
                                         matches_mask.append(match_int)
                                     return matches_mask
 
-                                Q_recovers_Q2 = count_binary_vector_matches(augmented_Q_prediction[pure_indices_of_recognized_words], Q2_probs[pure_indices_of_recognized_words])
-                                Q2_recovers_child = count_binary_vector_matches(selected_referents[pure_indices_of_recognized_words], Q2_probs[pure_indices_of_recognized_words])
+                                Q_recovers_Q2 = count_binary_vector_matches(augmented_Q_prediction[pure_indices_of_recognized_words], Q2_features[pure_indices_of_recognized_words])
+                                Q2_recovers_child = count_binary_vector_matches(selected_referents[pure_indices_of_recognized_words], Q2_features[pure_indices_of_recognized_words])
                             
                             elif ARCHITECTURE == 'eiwgan':                                                            
 
@@ -1082,7 +1082,7 @@ if __name__ == "__main__":
                                 pd.DataFrame(Q_prediction.detach().cpu().numpy()).to_csv(os.path.join(embeddings_path,str(epoch)+'_Q_prediction.csv'))
                                 pd.DataFrame(Q2_features.detach().cpu().numpy()).to_csv(os.path.join(embeddings_path,str(epoch)+'_Q2_sem_vecs.csv'))
 
-                                Q2_loss = torch.mean(criterion_Q2(Q_prediction[mixed_indices_of_recognized_words], Q2_sem_vecs[mixed_indices_of_recognized_words]))                                
+                                Q2_loss = torch.mean(criterion_Q2(Q_prediction[mixed_indices_of_recognized_words], mixed_Q2_features[mixed_indices_of_recognized_words]))                                
                                 print('Check if we recover the one-hot that was used to draw the continuously valued vector')                                
                                 Q2_recovers_child = torch.eq(torch.argmax(selected_referents[pure_indices_of_recognized_words], dim=1), one_hot_classify_sem_vector(Q2_sem_vecs[pure_indices_of_recognized_words], word_means)).cpu().numpy().tolist()                                
                                                                                                                     
@@ -1188,11 +1188,6 @@ if __name__ == "__main__":
                 t16 = time.time()
                 time_checkpoint(t2, t16, 'Step duration', step)
                 step += 1
-
-                # print('Look at profiling information')
-                # import pdb
-                # pdb.set_trace()
-                # print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=10))
                 
         # save out the articulation images
         if articul_out is not None: # may be undefined when fitting Q2
