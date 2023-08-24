@@ -98,7 +98,7 @@ class AudioDataSet:
 def get_architecture_appropriate_c(architecture, num_categ, batch_size):
     if ARCHITECTURE == 'ciwgan':
         c = torch.nn.functional.one_hot(torch.randint(0, num_categ, (batch_size,)),
-                                                num_classes=num_categ, device=device)
+                                                num_classes=num_categ).to(device)
     elif ARCHITECTURE == 'fiwgan':
         c = torch.zeros([batch_size, num_categ], device=device).bernoulli_()
     else:
@@ -202,11 +202,11 @@ class EuclideanLoss(nn.Module):
     def forward(self, inputs, targets):
         return torch.sqrt(torch.sum((inputs - targets) ** 2, dim=1))
 
-def get_replacement_features(architecture, num_examples, feature_size, device):
+def get_replacement_features(architecture, num_examples, feature_size, vocab_size, device):
     return_tensor = None
     if architecture == 'ciwgan':
         random_labels = torch.randint(low=0, high=vocab_size, size = (num_examples,), device=device)
-        onehot_per_word = F.one_hot(random_labels, num_classes = vocab_size, device=device)
+        onehot_per_word = F.one_hot(random_labels, num_classes = vocab_size).to(device)
         return_tensor = onehot_per_word
     elif architecture == 'fiwgan':
         # high parameter is exclusive
@@ -1005,7 +1005,7 @@ if __name__ == "__main__":
                         
                         Q2_features = Q2_cnn(selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE)
                         assert len(Q2_features.shape) == 2
-                        replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], Q2_features.shape[1], device)
+                        replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], len(vocab), Q2_features.shape[1], device)
                         mixed_Q2_features = add_noise_to_label(Q2_features, replacement_features, args.q2_noise_probability, device)
 
 
