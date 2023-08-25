@@ -26,7 +26,7 @@ import gc
 import wandb
 import yaml
 import time
-#from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 from infowavegan import WaveGANGenerator, ArticulationGANGenerator, WaveGANDiscriminator, ArticulationGANDiscriminator, WaveGANQNetwork, ArticulationGANQNetwork
@@ -827,8 +827,6 @@ if __name__ == "__main__":
                         G_z_for_G_update = G(z) # generate again using the same labels
                     elif args.synthesizer == "ArticulationGAN":
                         articul_out = G(z)
-                        # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:                        
-                        #     with record_function("synthesis"):                            
                         G_z_for_G_update = synthesize(EMA, articul_out.permute(0, 2, 1), synthesis_config, step)
 
                     # G Loss                    
@@ -867,6 +865,9 @@ if __name__ == "__main__":
 
                         print('Choosing '+str(Q2_BATCH_SIZE)+' best candidates for each word...')
 
+                        # with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+                        #    with record_function("num_candidates_section"):
+
                         if ARCHITECTURE == 'ciwgan':
                             predicted_value_loss = torch.nn.CrossEntropyLoss()
                             selected_referents = []
@@ -884,8 +885,6 @@ if __name__ == "__main__":
                                     candidate_wavs = G(torch.cat((candidate_referents, _z), dim=1))
                                 elif args.synthesizer == "ArticulationGAN":
                                     candidate_wavs = synthesize(EMA, G(torch.cat((candidate_referents, _z), dim=1)).permute(0, 2, 1), synthesis_config, step)                                
-                                # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:                        
-                                #     with record_function("Q decoding in utt selection"):
                                 candidate_Q_estimates = Q(candidate_wavs)
 
                                 # select the Q2_BATCH_SIZE items that are most likely to produce the correct response
@@ -1008,6 +1007,9 @@ if __name__ == "__main__":
                             selected_meanings =  torch.vstack(selected_meanings)
                             selected_referents = torch.vstack(selected_referents)
                             selected_Q_estimates = torch.vstack(selected_Q_estimates)  
+
+                        
+                        # import pdb; pdb.set_trace()
 
                         t9 = time.time()
                         time_checkpoint(t8, t9, 'Utterance selection', step)                        

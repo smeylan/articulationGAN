@@ -276,7 +276,6 @@ class WaveGANDiscriminator(torch.nn.Module):
 
         # Logit
         self.flat_dim = dim * 16 * 16 if slice_len == 16384 else dim * 16 * 64
-        print('here in flat dim initialization')
         self.fc_out = torch.nn.Linear(self.flat_dim, 1)
 
     def forward(self, x):
@@ -285,7 +284,6 @@ class WaveGANDiscriminator(torch.nn.Module):
         output = self.downconv_2(output)
         output = self.downconv_3(output)
         output = self.downconv_4(output)
-        print(self.flat_dim)
         output = self.fc_out(output.view(-1, self.flat_dim))
         return output
 
