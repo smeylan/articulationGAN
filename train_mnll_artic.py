@@ -29,7 +29,7 @@ import time
 #from torch.profiler import profile, record_function, ProfilerActivity
 
 
-from infowavegan import WaveGANGenerator, WaveGANDiscriminator, WaveGANQNetwork
+from infowavegan import WaveGANGenerator, ArticulationGANGenerator, WaveGANDiscriminator, ArticulationGANDiscriminator, WaveGANQNetwork, ArticulationGANQNetwork
 from articulatory.utils import load_model
 
 
@@ -580,24 +580,31 @@ if __name__ == "__main__":
     def make_new():
         if args.synthesizer == "WavGAN":
             G = WaveGANGenerator(slice_len=SLICE_LEN, ).to(device).train()
+            D = WaveGANDiscriminator(slice_len=SLICE_LEN).to(device).train()
         elif args.synthesizer == "ArticulationGAN":
             padding_len = (int)((args.kernel_len - 1)/2)
-            G = WaveGANGenerator(nch=args.num_channels, kernel_len=args.kernel_len,     padding_len=padding_len, use_batchnorm=False).to(device).train()        
+            G = ArticulationGANGenerator(nch=args.num_channels, kernel_len=args.kernel_len, padding_len=padding_len, use_batchnorm=False).to(device).train()        
+            D = ArticulationGANDiscriminator(slice_len=SLICE_LEN).to(device).train()
         EMA = load_model(synthesis_checkpoint_path, synthesis_config)
         EMA.remove_weight_norm()
         EMA = EMA.eval().to(device)        
-        D = WaveGANDiscriminator(slice_len=SLICE_LEN).to(device).train()
 
         # Optimizers
         optimizer_G = optim.Adam(G.parameters(), lr=LEARNING_RATE, betas=(BETA1, BETA2))
         optimizer_D = optim.Adam(D.parameters(), lr=LEARNING_RATE, betas=(BETA1, BETA2))
 
         Q, optimizer_Q_to_G, optimizer_Q_to_Q, criterion_Q, criterion_Q2 = (None, None, None, None, None)
+        if args.synthesizer == 'WavGAN':
+            create_Q_network_func = WaveGANQNetwork 
+        elif args.synthesizer == 'ArticulationGAN':
+            create_Q_network_func = ArticulationGANQNetwork 
+        else:
+            raise NotImplementedError
         if train_Q:
             if args.architecture in ('ciwgan','fiwgan'):
-                Q = WaveGANQNetwork(slice_len=SLICE_LEN, num_categ=NUM_CATEG).to(device).train()
+                Q = create_Q_network_func(slice_len=SLICE_LEN, num_categ=NUM_CATEG).to(device).train()
             elif args.architecture == 'eiwgan':
-                Q = WaveGANQNetwork(slice_len=SLICE_LEN, num_categ=NUM_DIM).to(device).train()
+                Q = create_Q_network_func(slice_len=SLICE_LEN, num_categ=NUM_DIM).to(device).train()
                 # number of dimensions in the sematnic space, not number of words
             else:
                 raise ValueError('Architecure not recognized! Must be fiwgan or ciwgan')
@@ -624,10 +631,9 @@ if __name__ == "__main__":
 
         if track_Q2:
             if ARCHITECTURE in ("ciwgan","fiwgan"):
-                Q2 = WaveGANQNetwork(slice_len=SLICE_LEN, num_categ=NUM_CATEG).to(device).train()
+                Q2 = create_Q_network_func(slice_len=SLICE_LEN, num_categ=NUM_CATEG).to(device).train()
             elif ARCHITECTURE == "eiwgan":
-                Q2 = WaveGANQNetwork(slice_len=SLICE_LEN, num_categ=NUM_DIM).to(device).train()
-            
+                Q2 = create_Q_network_func(slice_len=SLICE_LEN, num_categ=NUM_DIM).to(device).train()
 
             optimizer_Q2_to_QG = optim.RMSprop(it.chain(G.parameters(), Q.parameters()), lr=LEARNING_RATE)
             optimizer_Q2_to_Q2 = optim.RMSprop(Q2.parameters(), lr=LEARNING_RATE)
@@ -656,7 +662,7 @@ if __name__ == "__main__":
 
     step = start_step
 
-    Q2_network_path = 'saved_networks/adult_pretrained_Q_network_'+str(NUM_CATEG)+'_'+ARCHITECTURE+'.torch'
+    Q2_network_path = 'saved_networks/adult_pretrained_Q_network_'+args.synthesizer+str(NUM_CATEG)+'_'+ARCHITECTURE+'.torch'
 
     use_cached_Q2 = True
     if os.path.exists(Q2_network_path) and use_cached_Q2:
@@ -693,7 +699,7 @@ if __name__ == "__main__":
                 step += 1
         if not os.path.exists('saved_networks/'):
             os.makedirs('saved_networks/')
-        torch.save(Q2, 'saved_networks/adult_pretrained_Q_network_'+str(NUM_CATEG)+'_'+ARCHITECTURE+'.torch')
+        torch.save(Q2, 'saved_networks/adult_pretrained_Q_network_'+args.synthesizer+str(NUM_CATEG)+'_'+ARCHITECTURE+'.torch')
     
     # freeze Q2
     Q2.eval()        
@@ -768,7 +774,7 @@ if __name__ == "__main__":
              
                 # shuffle the reals so that the matched item for discrim is not necessarily from the same referent. This is because the GAN is learning to distinguish *unconditioned* draws from G with real examples                
                 shuffled_reals = reals[torch.randperm(reals.shape[0]),:,:]
-                
+
                 penalty = gradient_penalty(G, D, shuffled_reals, fakes, epsilon)
                 D_loss = torch.mean(D(fakes) - D(shuffled_reals) + LAMBDA * penalty)
                 
@@ -1002,7 +1008,6 @@ if __name__ == "__main__":
                         print('Recognizing G output with Q2 model...')
                         t10 = time.time()                        
 
-                        
                         Q2_features = Q2_cnn(selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE)
                         assert len(Q2_features.shape) == 2
                         replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], len(vocab), Q2_features.shape[1], device)
