@@ -364,7 +364,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         '--production_start_epoch',
-        action='store_true',
+        type=int,
         help='Do n-1 epochs of pretraining the child Q network in the reference game. 0 means produce from the beginning',
         default=0
     )
@@ -380,7 +380,7 @@ if __name__ == "__main__":
         '--q2_unk_threshold',
         type=float,
         help="Float representing the entropy or distance threshold that is maximally tolerated to backprop the example. Otherwise, consider the example an UNK",
-        default=.25
+        default=100000
     )
 
     parser.add_argument(
@@ -637,6 +637,10 @@ if __name__ == "__main__":
 
             optimizer_Q2_to_QG = optim.RMSprop(it.chain(G.parameters(), Q.parameters()), lr=LEARNING_RATE)
             optimizer_Q2_to_Q2 = optim.RMSprop(Q2.parameters(), lr=LEARNING_RATE)
+
+            if PRODUCTION_START_EPOCH > 0:
+                optimizer_Q_to_Q = optim.RMSprop(Q.parameters(), lr=LEARNING_RATE)
+
             
             if ARCHITECTURE == 'fiwgan':
                 criterion_Q2 = torch.nn.BCEWithLogitsLoss() # binary cross entropy
@@ -650,10 +654,10 @@ if __name__ == "__main__":
             else:
                 raise NotImplementedError        
 
-        return G, D, EMA, optimizer_G, optimizer_D, Q, Q2, optimizer_Q_to_QG, optimizer_Q2_to_QG, optimizer_Q2_to_Q2, criterion_Q, criterion_Q2
+        return G, D, EMA, optimizer_G, optimizer_D, Q, Q2, optimizer_Q_to_QG, optimizer_Q2_to_QG, optimizer_Q2_to_Q2, optimizer_Q_to_Q, criterion_Q, criterion_Q2
 
     # Load models    
-    G, D, EMA, optimizer_G, optimizer_D, Q, Q2, optimizer_Q_to_QG, optimizer_Q2_to_QG, optimizer_Q2_to_Q2, criterion_Q, criterion_Q2 = make_new()
+    G, D, EMA, optimizer_G, optimizer_D, Q, Q2, optimizer_Q_to_QG, optimizer_Q2_to_QG, optimizer_Q2_to_Q2, optimizer_Q_to_Q, criterion_Q, criterion_Q2 = make_new()
     
     start_epoch = 0
     start_step = 0
@@ -717,12 +721,16 @@ if __name__ == "__main__":
         for i, trial in enumerate(pbar):
             
             reals = trial[0].to(device)
-            labels = trial[1].to(device)
+            labels = trial[1].to(device)            
            
             if (epoch <= PRODUCTION_START_EPOCH) or (epoch % COMPREHENSION_INTERVAL == 0):
+
+
                 # Just train the Q network from external data
                 if ARCHITECTURE == 'eiwgan':
-                    # pretraining not implemented yet for eiwgan. Should be simple though -- Q(reals) in the same way, with a Euclidean loss function
+                    # pretraining not implemented yet for eiwgan. Should be simple though -- Q(reals) in the same way, with a Euclidean loss function                
+                    adult_label_to_recover = trial[2].to(device)
+                else:
                     raise NotImplementedError
                 
                 if label_stages:
@@ -730,7 +738,7 @@ if __name__ == "__main__":
 
                 optimizer_Q_to_Q.zero_grad()
                 child_recovers_from_adult = Q(reals)    
-                Q_comprehension_loss = criterion_Q(child_recovers_from_adult, labels[:,0:NUM_CATEG])
+                Q_comprehension_loss = torch.mean(criterion_Q2(child_recovers_from_adult, adult_label_to_recover))
                 Q_comprehension_loss.backward()
                 wandb.log({"Loss/Q to Q": Q_comprehension_loss.detach().item()}, step=step)
                 optimizer_Q_to_Q.step()
@@ -1010,7 +1018,8 @@ if __name__ == "__main__":
 
                         Q2_features = Q2_cnn(selected_candidate_wavs.unsqueeze(1), Q2, ARCHITECTURE)
                         assert len(Q2_features.shape) == 2
-                        replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], len(vocab), Q2_features.shape[1], device)
+                        #replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], len(vocab), Q2_features.shape[1], device)
+                        replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], Q2_features.shape[1], len(vocab), device)
                         mixed_Q2_features = add_noise_to_label(Q2_features, replacement_features, args.q2_noise_probability, device)
 
 
@@ -1036,13 +1045,15 @@ if __name__ == "__main__":
 
                             # Q_of_selected_candidates is the expected value of each utterance
 
-                            Q_prediction = torch.softmax(selected_Q_estimates, dim=1)  
+                            #Q_prediction = torch.softmax(selected_Q_estimates, dim=1)  
                             zero_tensor = torch.zeros(selected_Q_estimates.shape[0],1, device=device)  # for padding the UNKs, in logit space                              
     
                             # this is a one shot game for each reference, so implicitly the value before taking the action is 0. I might update this later, i.e., think about this in terms of sequences                   
                                                     
                             # compute the cross entropy between the Q network and the Q2 outputs, which are class labels recovered by the adults                                                    
                             if ARCHITECTURE == 'ciwgan':    
+                        
+                                Q_prediction = torch.softmax(selected_Q_estimates, dim=1)
                                 augmented_Q_prediction = torch.log(torch.hstack((Q_prediction, zero_tensor)) + .0000001)
                                 
                                 mixed_Q2_loss = criterion_Q2(augmented_Q_prediction[mixed_indices_of_recognized_words], mixed_Q2_features[mixed_indices_of_recognized_words])   
@@ -1058,6 +1069,7 @@ if __name__ == "__main__":
 
                             elif ARCHITECTURE == 'fiwgan':
 
+                                Q_prediction = torch.softmax(selected_Q_estimates, dim=1)
                                 augmented_Q_prediction = torch.log(Q_prediction + .0000001)   
                                 mixed_Q2_loss = criterion_Q2(augmented_Q_prediction[mixed_indices_of_recognized_words], mixed_Q2_features[mixed_indices_of_recognized_words])   
                                 with torch.no_grad():
@@ -1076,8 +1088,8 @@ if __name__ == "__main__":
                                 Q_recovers_Q2 = count_binary_vector_matches(augmented_Q_prediction[pure_indices_of_recognized_words], Q2_features[pure_indices_of_recognized_words])
                                 Q2_recovers_child = count_binary_vector_matches(selected_referents[pure_indices_of_recognized_words], Q2_features[pure_indices_of_recognized_words])
                             
-                            elif ARCHITECTURE == 'eiwgan':                                                            
-
+                            elif ARCHITECTURE == 'eiwgan': 
+                                Q_prediction = selected_Q_estimates
                                 embeddings_path = os.path.join(logdir,'meaning_embeddings')
                                 if not os.path.exists(embeddings_path):
                                     os.makedirs(embeddings_path)
@@ -1089,7 +1101,7 @@ if __name__ == "__main__":
 
                                 Q2_loss = torch.mean(criterion_Q2(Q_prediction[mixed_indices_of_recognized_words], mixed_Q2_features[mixed_indices_of_recognized_words]))                                
                                 print('Check if we recover the one-hot that was used to draw the continuously valued vector')                                
-                                Q2_recovers_child = torch.eq(torch.argmax(selected_referents[pure_indices_of_recognized_words], dim=1), one_hot_classify_sem_vector(Q2_sem_vecs[pure_indices_of_recognized_words], word_means)).cpu().numpy().tolist()                                
+                                Q2_recovers_child = torch.eq(torch.argmax(selected_referents[pure_indices_of_recognized_words], dim=1), one_hot_classify_sem_vector(Q2_features[pure_indices_of_recognized_words], word_means)).cpu().numpy().tolist()                                
                                                                                                                     
                             #this is where we would compute the loss
                             if args.backprop_from_Q2:
@@ -1195,7 +1207,7 @@ if __name__ == "__main__":
                 step += 1
                 
         # save out the articulation images
-        if articul_out is not None: # may be undefined when fitting Q2
+        if 'articul_out' in locals(): # may be undefined when fitting Q2
             t14 = time.time()
             artic_path = os.path.join(logdir,'artic_trajectories',str(epoch))
             if not os.path.exists(artic_path):
