@@ -727,7 +727,7 @@ if __name__ == "__main__":
                 if ARCHITECTURE == 'eiwgan':
                     # pretraining not implemented yet for eiwgan. Should be simple though -- Q(reals) in the same way, with a Euclidean loss function                
                     adult_label_to_recover = trial[2].to(device)   
-                elif ARCHITECTURE == 'ciwgan':
+                elif ARCHITECTURE in {'ciwgan', 'fiwgan'}:
                     adult_label_to_recover = trial[1].to(device)
                     
                     
