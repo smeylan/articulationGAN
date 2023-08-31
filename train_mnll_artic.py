@@ -75,7 +75,7 @@ class AudioDataSet:
             # implicitly, we could have generated these in the semantic space first, and run a classifier to get y values
             sem_vector_store = {} 
             for i in range(NUM_CATEG):
-                sem_vector_store[i] = scipy.stats.multivariate_normal.rvs( mean=word_means[i], cov=sigma, size = len(files))
+                sem_vector_store[i] = scipy.stats.multivariate_normal.rvs(mean=word_means[i], cov=sigma, size = len(files))
 
             # the category label i indexes the key in sem_vector_store, j indexes the row (ie many rows are not used)                 
             sem_vector =  [sem_vector_store[i][j,:] for i,j in zip(categ_labels, range(len(files)))]   
@@ -207,7 +207,8 @@ def get_replacement_features(architecture, num_examples, feature_size, vocab_siz
     if architecture == 'ciwgan':
         random_labels = torch.randint(low=0, high=vocab_size, size = (num_examples,), device=device)
         onehot_per_word = F.one_hot(random_labels, num_classes = vocab_size).to(device)
-        return_tensor = onehot_per_word
+        zero_tensor = torch.zeros(num_examples,1, device=device)        
+        return_tensor = torch.hstack([onehot_per_word, zero_tensor])
     elif architecture == 'fiwgan':
         # high parameter is exclusive
         return_tensor = torch.randint(low=0, high=2, size = (num_examples, feature_size), device=device)   
@@ -278,13 +279,12 @@ def sample_multivatiate_normal(word_indices, word_means, sigma, NUM_CATEG, BATCH
         sem_vectors.append(torch.distributions.MultivariateNormal(word_means[categ_index].double(), sigma.double()).sample((BATCH_SIZE,)))                
 
     sem_vec_store = torch.stack(sem_vectors).float()
+    # num words x batch size x sem vectors
     c = torch.vstack([sem_vec_store[i,j,:] for i,j in zip(word_indices, range(BATCH_SIZE))])
     return(c)
 
 def sample_multivatiate_normal_for_categ(categ_index, word_means, sigma, BATCH_SIZE):
     return(torch.distributions.MultivariateNormal(word_means[categ_index].double(), sigma.double()).sample((BATCH_SIZE,)).float())                
-
-    
     
 
 if __name__ == "__main__":
@@ -662,7 +662,7 @@ if __name__ == "__main__":
 
     Q2_network_path = 'saved_networks/adult_pretrained_Q_network_'+str(NUM_CATEG)+'_'+ARCHITECTURE+'.torch'
 
-    use_cached_Q2 = True
+    use_cached_Q2 = False
     if os.path.exists(Q2_network_path) and use_cached_Q2:
         print('Loading a Previous Adult Q2 CNN Network')
         Q2 = torch.load(Q2_network_path).to(device)
@@ -670,7 +670,7 @@ if __name__ == "__main__":
     else:
         print('Training an Adult Q2 CNN Network')
         step = start_step
-        for epoch in range(start_epoch + 1, NUM_Q2_TRAINING_EPOCHS):
+        for epoch in range(start_epoch, NUM_Q2_TRAINING_EPOCHS):
             print("Epoch {} of {}".format(epoch, NUM_Q2_TRAINING_EPOCHS))
             print("-----------------------------------------")
 
@@ -687,7 +687,7 @@ if __name__ == "__main__":
                     Q2_comprehension_loss = criterion_Q(Q2_logits, labels[:,0:NUM_CATEG]) # Note we exclude the UNK label --  child never intends to produce unk
                 elif ARCHITECTURE == 'fiwgan':
                     Q2_comprehension_loss = criterion_Q(Q2_logits, labels)
-                elif ARCHITECTURE == "eiwgan":                    
+                elif ARCHITECTURE == "eiwgan":                      
                     Q2_comprehension_loss = torch.mean(criterion_Q(Q2_logits, continuous_labels))
 
                 Q2_comprehension_loss.backward()
@@ -716,23 +716,27 @@ if __name__ == "__main__":
             
             reals = trial[0].to(device)
             labels = trial[1].to(device)            
-           
+
             if (epoch <= PRODUCTION_START_EPOCH) or (epoch % COMPREHENSION_INTERVAL == 0):
 
 
                 # Just train the Q network from external data
                 if ARCHITECTURE == 'eiwgan':
                     # pretraining not implemented yet for eiwgan. Should be simple though -- Q(reals) in the same way, with a Euclidean loss function                
-                    adult_label_to_recover = trial[2].to(device)
-                else:
-                    raise NotImplementedError
+                    adult_label_to_recover = trial[2].to(device)   
+                elif ARCHITECTURE == 'ciwgan':
+                    adult_label_to_recover = trial[1].to(device)
+                    
+                    
+                    # need to check adult_label_to_recover still works -- should probably be trails[1].to_device() 
                 
                 if label_stages:
                     print('Updating Child Q network to identify referents')
 
                 optimizer_Q_to_Q.zero_grad()
-                child_recovers_from_adult = Q(reals)    
-                Q_comprehension_loss = torch.mean(criterion_Q2(child_recovers_from_adult, adult_label_to_recover))
+                child_recovers_from_adult = Q(reals)
+                Q_comprehension_loss = torch.mean(criterion_Q2(child_recovers_from_adult, adult_label_to_recover))                
+
                 Q_comprehension_loss.backward()
                 wandb.log({"Loss/Q to Q": Q_comprehension_loss.detach().item()}, step=step)
                 optimizer_Q_to_Q.step()
@@ -752,7 +756,7 @@ if __name__ == "__main__":
                     words = torch.nn.functional.one_hot(torch.randint(0, NUM_CATEG, (BATCH_SIZE,)),
                              num_classes=NUM_CATEG).detach().numpy() # randomly generate a bunch of one-hots
                     word_indices = [x[1] for x in np.argwhere(words)]                                                                                       
-                    c = sample_multivatiate_normal(word_indices, word_means, sigma, NUM_CATEG, BATCH_SIZE)
+                    c = sample_multivatiate_normal(word_indices, word_means, sigma, NUM_CATEG, BATCH_SIZE)                    
                     _z = torch_uniform([BATCH_SIZE, 100 - NUM_DIM], -1,1, device) 
                     z = torch.cat((c, _z), dim=1)
 
@@ -804,7 +808,7 @@ if __name__ == "__main__":
                         words = torch.nn.functional.one_hot(torch.randint(0, NUM_CATEG, (BATCH_SIZE,)),
                              num_classes=NUM_CATEG).detach().numpy() # randomly generate a bunch of one-hots
                         word_indices = [x[1] for x in np.argwhere(words)]                                                                    
-                        c = sample_multivatiate_normal(word_indices, word_means, sigma, NUM_CATEG, BATCH_SIZE)
+                        c = sample_multivatiate_normal(word_indices, word_means, sigma, NUM_CATEG, BATCH_SIZE)                        
                         _z = torch_uniform([BATCH_SIZE, 100 - NUM_DIM], -1,1, device)                    
                         z = torch.cat((c, _z), dim=1)
                     elif ARCHITECTURE == 'fiwgan':
@@ -958,9 +962,7 @@ if __name__ == "__main__":
 
                                 # propagae the categorical label associated with the Gaussian for checking what Q2 infers
                                 candidate_referents = torch.zeros([Q2_BATCH_SIZE*num_candidates_to_consider_per_word, NUM_CATEG+1], device=device)
-                                candidate_referents[:,categ_index] = 1                                
-
-                                print('check if multivaraite sampleing is working')
+                                candidate_referents[:,categ_index] = 1                                                                
                                                                 
                                 #candidate_meanings rather than candidate references                                
                                 candidate_meanings = sample_multivatiate_normal_for_categ(categ_index, word_means, sigma, Q2_BATCH_SIZE*num_candidates_to_consider_per_word)
@@ -1016,7 +1018,6 @@ if __name__ == "__main__":
                         #replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], len(vocab), Q2_features.shape[1], device)
                         replacement_features = get_replacement_features(ARCHITECTURE, Q2_features.shape[0], Q2_features.shape[1], len(vocab), device)
                         mixed_Q2_features = add_noise_to_label(Q2_features, replacement_features, args.q2_noise_probability, device)
-
 
                         if ARCHITECTURE == 'ciwgan':
                             mixed_indices_of_recognized_words = get_non_UNK_in_Q2_ciwgan(mixed_Q2_features, SELECTION_THRESHOLD, device)
@@ -1109,12 +1110,12 @@ if __name__ == "__main__":
                             else:
                                 print('Computing Q2 network loss but not backpropagating...')
                                 
-                            print('Gradients on the Q network:')
-                            print('Q layer 0: '+str(np.round(torch.sum(torch.abs(Q.downconv_0.conv.weight.grad)).cpu().numpy(), 10)))
-                            print('Q layer 1: '+str(np.round(torch.sum(torch.abs(Q.downconv_1.conv.weight.grad)).cpu().numpy(), 10)))
-                            print('Q layer 2: '+str(np.round(torch.sum(torch.abs(Q.downconv_2.conv.weight.grad)).cpu().numpy(), 10)))
-                            print('Q layer 3: '+str(np.round(torch.sum(torch.abs(Q.downconv_3.conv.weight.grad)).cpu().numpy(), 10)))
-                            print('Q layer 4: '+str(np.round(torch.sum(torch.abs(Q.downconv_4.conv.weight.grad)).cpu().numpy(), 10)))
+                            # print('Gradients on the Q network:')
+                            # print('Q layer 0: '+str(np.round(torch.sum(torch.abs(Q.downconv_0.conv.weight.grad)).cpu().numpy(), 10)))
+                            # print('Q layer 1: '+str(np.round(torch.sum(torch.abs(Q.downconv_1.conv.weight.grad)).cpu().numpy(), 10)))
+                            # print('Q layer 2: '+str(np.round(torch.sum(torch.abs(Q.downconv_2.conv.weight.grad)).cpu().numpy(), 10)))
+                            # print('Q layer 3: '+str(np.round(torch.sum(torch.abs(Q.downconv_3.conv.weight.grad)).cpu().numpy(), 10)))
+                            # print('Q layer 4: '+str(np.round(torch.sum(torch.abs(Q.downconv_4.conv.weight.grad)).cpu().numpy(), 10)))
 
                             #print('Q2 -> Q update!')
                             #this is where we would do the step
