@@ -206,14 +206,8 @@ def get_replacement_features(architecture, num_examples, feature_size, vocab_siz
     return_tensor = None
     if architecture == 'ciwgan':
         random_labels = torch.randint(low=0, high=vocab_size, size = (num_examples,), device=device)
-<<<<<<< HEAD
-        onehot_per_word = F.one_hot(random_labels, num_classes = vocab_size).to(device)
-        zero_tensor = torch.zeros(num_examples,1, device=device)        
-        return_tensor = torch.hstack([onehot_per_word, zero_tensor])
-=======
         onehot_per_word = F.one_hot(random_labels, num_classes = vocab_size + 1).to(device)
         return_tensor = onehot_per_word
->>>>>>> 3d3c184471c842542ca6aa0a07120a03d6f26a99
     elif architecture == 'fiwgan':
         # high parameter is exclusive
         return_tensor = torch.randint(low=0, high=2, size = (num_examples, feature_size), device=device)   
