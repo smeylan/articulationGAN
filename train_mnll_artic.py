@@ -486,9 +486,6 @@ if __name__ == "__main__":
 
     if args.synthesizer == 'ArticulationGAN':
         assert args.slice_len == 20480, "ArticulationGAN only supports a slice length of 20480"
-    
-    if args.q2_noise_probability > 0:
-        assert ARCHITECTURE != 'eiwgan', "Eiwgan does not have noise probability support."
 
     assert args.synthesizer in ("WavGAN","ArticulationGAN"), "synthesizer must be one of 'ArticulationGAN' or 'WavGAN'"
 

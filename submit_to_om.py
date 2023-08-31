@@ -19,7 +19,7 @@ def gen_one_model_submission_script(model, singularity_base_command, slurm_param
         commands.append("#SBATCH -p "+slurm_params['partition']+"\n")    
     commands.append("#SBATCH -t "+slurm_params['time_alloc_hrs_str']+"\n")
     commands.append("#SBATCH --mem="+str(slurm_params['mem_alloc_gb'])+"G\n")
-    commands.append("#SBATCH --gres=gpu:1\n")
+    commands.append("#SBATCH --gres=gpu:a100:1\n")
     commands.append("#SBATCH --constraint="+slurm_params['gpu_constraint']+"\n")
     commands.append("#SBATCH --exclude="+slurm_params['exclusion_list']+"\n")
     commands.append("#SBATCH --ntasks="+str(slurm_params['n_tasks'])+"\n")
