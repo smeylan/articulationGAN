@@ -1,0 +1,222 @@
+{
+	"defaults":
+	{
+		"track_q2": 1,
+		"data_dir": "data/TIMIT_padded_smallVocab",
+		"log_dir": "logs",
+		"batch_size": 64,
+		"num_epochs": 7,
+		"wandb_group": "check_for_run_cross",
+		"wandb_project": "mnll-onehots",
+		"vocab": "'dark greasy water year'",
+		"backprop_from_Q2" : 1,
+		"emadir" : "articulatory_weights/"
+	},
+	"models": [
+		{
+			"wandb_name" : "ciwgan_A_pretrained_0",
+			"architecture" : "ciwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0,
+            "slice_len" : 20480
+        },
+        {
+			"wandb_name" : "fiwgan_A_pretrained_0",
+			"architecture" : "fiwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0,
+            "slice_len" : 20480
+        },
+        {
+			"wandb_name" : "eiwgan_A_pretrained_0",
+			"architecture" : "eiwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0,
+            "slice_len" : 20480
+        },
+        {
+			"wandb_name" : "ciwgan_A_not_pretrained_0",
+			"architecture" : "ciwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0,
+            "slice_len" : 20480
+        },
+		{
+			"wandb_name" : "fiwgan_A_not_pretrained_0",
+			"architecture" : "fiwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0,
+            "slice_len" : 20480
+        },
+		{
+			"wandb_name" : "eiwgan_A_not_pretrained_0",
+			"architecture" : "eiwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0,
+            "slice_len" : 20480
+        },
+		{
+			"wandb_name" : "ciwgan_W_pretrained_0",
+			"architecture" : "ciwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0,
+            "slice_len" : 16384
+        },
+        {
+			"wandb_name" : "fiwgan_W_pretrained_0",
+			"architecture" : "fiwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0,
+            "slice_len" : 16384
+        },
+        {
+			"wandb_name" : "eiwgan_W_pretrained_0",
+			"architecture" : "eiwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0,
+            "slice_len" : 16384
+        },
+        {
+			"wandb_name" : "ciwgan_W_not_pretrained_0",
+			"architecture" : "ciwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0,
+            "slice_len" : 16384
+        },
+		{
+			"wandb_name" : "fiwgan_W_not_pretrained_0",
+			"architecture" : "fiwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0,
+            "slice_len" : 16384
+        },
+		{
+			"wandb_name" : "eiwgan_W_not_pretrained_0",
+			"architecture" : "eiwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0,
+            "slice_len" : 16384
+        },
+        {
+			"wandb_name" : "ciwgan_A_pretrained_0.1",
+			"architecture" : "ciwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 20480
+        },
+        {
+			"wandb_name" : "fiwgan_A_pretrained_0.1",
+			"architecture" : "fiwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 20480
+        },
+        {
+			"wandb_name" : "eiwgan_A_pretrained_0.1",
+			"architecture" : "eiwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 20480
+        },
+        {
+			"wandb_name" : "ciwgan_A_not_pretrained_0.1",
+			"architecture" : "ciwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 20480
+        },
+		{
+			"wandb_name" : "fiwgan_A_not_pretrained_0.1",
+			"architecture" : "fiwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 20480
+        },
+		{
+			"wandb_name" : "eiwgan_A_not_pretrained_0.1",
+			"architecture" : "eiwgan",
+            "synthesizer" : "ArticulationGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 20480
+        },
+		{
+			"wandb_name" : "ciwgan_W_pretrained_0.1",
+			"architecture" : "ciwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 16384
+        },
+        {
+			"wandb_name" : "fiwgan_W_pretrained_0.1",
+			"architecture" : "fiwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 16384
+        },
+        {
+			"wandb_name" : "eiwgan_W_pretrained_0.1",
+			"architecture" : "eiwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 5,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 16384
+        },
+        {
+			"wandb_name" : "ciwgan_W_not_pretrained_0.1",
+			"architecture" : "ciwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 16384
+        },
+		{
+			"wandb_name" : "fiwgan_W_not_pretrained_0.1",
+			"architecture" : "fiwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 16384
+        },
+		{
+			"wandb_name" : "eiwgan_W_not_pretrained_0.1",
+			"architecture" : "eiwgan",
+            "synthesizer" : "WavGAN",
+            "production_start_epoch" : 0,
+            "q2_noise_probability" : 0.1,
+            "slice_len" : 16384
+        }
+	],
+	"slurm":
+	{
+		"script": "train_mnll_artic.py",
+		"N": 1,
+		"mem_alloc_gb": 64,
+		"time_alloc_hrs_str": "00:20:00",
+		"cpus_per_task": 8,
+		"n_tasks": 1,
+		"gpu_constraint": "40GB",
+		"singularity_version": "openmind/singularity/3.9.5",
+		"exclusion_list": "node082,node083,node100",
+		"slurm_folder":"slurm_logs"
+	}
+}
