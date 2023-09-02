@@ -206,8 +206,9 @@ def get_replacement_features(architecture, num_examples, feature_size, vocab_siz
     return_tensor = None
     if architecture == 'ciwgan':
         random_labels = torch.randint(low=0, high=vocab_size, size = (num_examples,), device=device)
-        onehot_per_word = F.one_hot(random_labels, num_classes = vocab_size + 1).to(device)
-        return_tensor = onehot_per_word
+        onehot_per_word = F.one_hot(random_labels, num_classes = vocab_size).to(device)
+        zero_tensor = torch.zeros(num_examples,1, device=device)        
+        return_tensor = torch.hstack([onehot_per_word, zero_tensor])
     elif architecture == 'fiwgan':
         # high parameter is exclusive
         return_tensor = torch.randint(low=0, high=2, size = (num_examples, feature_size), device=device)   
@@ -959,7 +960,7 @@ if __name__ == "__main__":
                             for categ_index in range(NUM_CATEG):
                                 
                                 # increasing this breaks stuff. Results in considering a larger space
-                                num_candidates_to_consider_per_word = 1 
+                                num_candidates_to_consider_per_word = 12 
 
                                 # propagae the categorical label associated with the Gaussian for checking what Q2 infers
                                 candidate_referents = torch.zeros([Q2_BATCH_SIZE*num_candidates_to_consider_per_word, NUM_CATEG+1], device=device)
